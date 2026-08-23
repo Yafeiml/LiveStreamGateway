@@ -15,8 +15,20 @@ let appState = {
     previewUrl: null,
     previewRecoveryAttempts: 0,
     previewMediaRecoveries: 0,
+    previewHardRecoveries: 0,
+    previewLastHardRecoveryAt: 0,
+    previewLastMediaRecoveryAt: 0,
+    previewLastSoftRecoveryAt: 0,
+    previewSevereErrorCount: 0,
+    previewLastSevereErrorAt: 0,
     previewLastProgressAt: 0,
     previewLastTime: 0,
+    previewBufferedFragments: 0,
+    previewLastFragEndPts: null,
+    previewLastFragSequence: null,
+    previewLastFragContinuity: null,
+    previewAudioCodecSignature: null,
+    previewRecoveryExhausted: false,
     pollTimer: null,
     urlDebounceTimer: null,
     authenticated: false,
@@ -24,6 +36,16 @@ let appState = {
     managementStarted: false,
     handlingUnauthorized: false
 };
+
+const PREVIEW_MAX_RELOAD_ATTEMPTS = 6;
+const PREVIEW_MAX_MEDIA_RECOVERIES = 2;
+const PREVIEW_MAX_HARD_RECOVERIES = 3;
+const PREVIEW_HARD_RECOVERY_COOLDOWN_MS = 8000;
+const PREVIEW_MEDIA_RECOVERY_COOLDOWN_MS = 5000;
+const PREVIEW_SOFT_STALL_RECOVERY_MS = 6000;
+const PREVIEW_HARD_STALL_RECOVERY_MS = 12000;
+const PREVIEW_SEVERE_ERROR_WINDOW_MS = 10000;
+const PREVIEW_TIMESTAMP_GAP_SECONDS = 1.5;
 
 document.addEventListener('DOMContentLoaded', () => {
     initApp();
@@ -1394,14 +1416,27 @@ function openPreviewModal(id, name, relativeHlsUrl) {
     appState.previewUrl = fullUrl;
     appState.previewRecoveryAttempts = 0;
     appState.previewMediaRecoveries = 0;
+    appState.previewHardRecoveries = 0;
+    appState.previewLastHardRecoveryAt = 0;
+    appState.previewLastMediaRecoveryAt = 0;
+    appState.previewLastSoftRecoveryAt = 0;
+    appState.previewSevereErrorCount = 0;
+    appState.previewLastSevereErrorAt = 0;
     appState.previewLastProgressAt = performance.now();
     appState.previewLastTime = 0;
+    appState.previewBufferedFragments = 0;
+    appState.previewLastFragEndPts = null;
+    appState.previewLastFragSequence = null;
+    appState.previewLastFragContinuity = null;
+    appState.previewAudioCodecSignature = null;
+    appState.previewRecoveryExhausted = false;
 
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
         createHlsPreviewPlayer(fullUrl, token);
         startPreviewStallMonitor(token);
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         // Native Safari / iOS HLS support
+        bindPreviewMediaProgressEvents(video, token);
         video.src = fullUrl;
         video.onloadedmetadata = () => {
             video.play().catch(() => {});
@@ -1413,6 +1448,7 @@ function openPreviewModal(id, name, relativeHlsUrl) {
             errorMsg.style.display = 'block';
             window.clearTimeout(appState.hlsRetryTimer);
             appState.hlsRetryTimer = window.setTimeout(() => {
+                appState.hlsRetryTimer = null;
                 if (token !== appState.previewToken) return;
                 video.src = fullUrl;
                 video.load();
@@ -1430,10 +1466,9 @@ function createHlsPreviewPlayer(fullUrl, token) {
     const errorMsg = document.getElementById('player-error-msg');
     if (!video || token !== appState.previewToken) return;
 
-    if (appState.hlsPlayer) {
-        appState.hlsPlayer.destroy();
-        appState.hlsPlayer = null;
-    }
+    // 每次重连都释放旧 MediaSource/SourceBuffer，避免沿用异常的音频解码状态。
+    destroyHlsPreviewInstance(video);
+    resetPreviewGenerationState();
 
     const hls = new Hls({
         enableWorker: true,
@@ -1449,58 +1484,62 @@ function createHlsPreviewPlayer(fullUrl, token) {
         levelLoadingTimeOut: 10000,
         levelLoadingMaxRetry: 4,
         fragLoadingTimeOut: 20000,
-        fragLoadingMaxRetry: 6
+        fragLoadingMaxRetry: 6,
+        detectStallWithCurrentTimeMs: 2500,
+        nudgeOnVideoHole: true,
+        liveSyncOnStallIncrease: 1
     });
     appState.hlsPlayer = hls;
+    bindPreviewMediaProgressEvents(video, token);
 
     hls.on(Hls.Events.MEDIA_ATTACHED, () => {
-        if (token === appState.previewToken) hls.loadSource(fullUrl);
+        if (token === appState.previewToken && hls === appState.hlsPlayer)
+            hls.loadSource(fullUrl);
     });
 
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        if (token !== appState.previewToken) return;
-        window.clearTimeout(appState.hlsRetryTimer);
-        appState.hlsRetryTimer = null;
-        errorMsg.style.display = 'none';
+        if (token !== appState.previewToken || hls !== appState.hlsPlayer) return;
         video.play().catch(() => {});
     });
 
-    hls.on(Hls.Events.FRAG_BUFFERED, () => {
-        if (token !== appState.previewToken) return;
-        window.clearTimeout(appState.hlsRetryTimer);
-        appState.hlsRetryTimer = null;
-        appState.previewRecoveryAttempts = 0;
-        appState.previewMediaRecoveries = 0;
-        appState.previewLastProgressAt = performance.now();
-        errorMsg.style.display = 'none';
+    hls.on(Hls.Events.BUFFER_CODECS, (_event, data) => {
+        if (token !== appState.previewToken || hls !== appState.hlsPlayer) return;
+        detectPreviewAudioCodecChange(data, fullUrl, token);
+    });
+
+    hls.on(Hls.Events.LEVEL_PTS_UPDATED, (_event, data) => {
+        if (token !== appState.previewToken || hls !== appState.hlsPlayer) return;
+        detectPreviewTimestampDrift(data, fullUrl, token);
+    });
+
+    hls.on(Hls.Events.FRAG_BUFFERED, (_event, data) => {
+        if (token !== appState.previewToken || hls !== appState.hlsPlayer) return;
+        inspectPreviewFragmentTimeline(data, fullUrl, token);
+        // 分片到达不等于播放器实际前进，不能在这里刷新播放进展或恢复次数。
+        if (!appState.hlsRetryTimer && !appState.previewRecoveryExhausted)
+            errorMsg.style.display = 'none';
     });
 
     hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (token !== appState.previewToken) return;
-
-        if (!data.fatal) {
-            if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR)
-                recoverHlsPreviewToLiveEdge(hls, video);
-            return;
-        }
-
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            scheduleHlsPreviewReload(fullUrl, token, `直播网络中断 (${data.details})`);
-            return;
-        }
-
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && appState.previewMediaRecoveries < 2) {
-            appState.previewMediaRecoveries++;
-            errorMsg.innerText = `媒体解码异常，正在恢复 (${data.details})...`;
-            errorMsg.style.display = 'block';
-            hls.recoverMediaError();
-            return;
-        }
-
-        scheduleHlsPreviewReload(fullUrl, token, `播放中断 (${data.details})`);
+        handleHlsPreviewError(hls, video, fullUrl, token, data);
     });
 
-    video.onstalled = () => recoverHlsPreviewToLiveEdge(hls, video);
+    video.onstalled = () => {
+        if (hls !== appState.hlsPlayer) return;
+        handlePreviewPlaybackStall(hls, video, fullUrl, token);
+    };
+    video.onerror = () => {
+        if (token !== appState.previewToken || hls !== appState.hlsPlayer) return;
+        const code = video.error?.code ?? 'unknown';
+        // 先让 hls.js 的 ERROR 处理器执行；只有它没有接管时才升级为深度重建。
+        window.setTimeout(() => {
+            if (token !== appState.previewToken || hls !== appState.hlsPlayer || appState.hlsRetryTimer) return;
+            const recentlyRecovered = appState.previewLastMediaRecoveryAt > 0 &&
+                performance.now() - appState.previewLastMediaRecoveryAt < 1000;
+            if (!recentlyRecovered)
+                scheduleHardPreviewRecovery(fullUrl, token, `浏览器媒体解码异常 (${code})`);
+        }, 250);
+    };
     hls.attachMedia(video);
 }
 
@@ -1508,6 +1547,13 @@ function scheduleHlsPreviewReload(fullUrl, token, reason) {
     if (token !== appState.previewToken || appState.hlsRetryTimer) return;
 
     const errorMsg = document.getElementById('player-error-msg');
+    if (appState.previewRecoveryAttempts >= PREVIEW_MAX_RELOAD_ATTEMPTS) {
+        appState.previewRecoveryExhausted = true;
+        errorMsg.innerText = `${reason}。自动重连已达上限，请关闭后重新打开试播。`;
+        errorMsg.style.display = 'block';
+        return;
+    }
+
     appState.previewRecoveryAttempts++;
     const delay = Math.min(1000 * Math.pow(2, Math.min(appState.previewRecoveryAttempts - 1, 3)), 8000);
     errorMsg.innerText = `${reason}，${Math.ceil(delay / 1000)} 秒后重新连接...`;
@@ -1520,6 +1566,259 @@ function scheduleHlsPreviewReload(fullUrl, token, reason) {
     }, delay);
 }
 
+function scheduleHardPreviewRecovery(fullUrl, token, reason) {
+    if (token !== appState.previewToken || appState.hlsRetryTimer) return;
+
+    const errorMsg = document.getElementById('player-error-msg');
+    if (appState.previewHardRecoveries >= PREVIEW_MAX_HARD_RECOVERIES) {
+        appState.previewRecoveryExhausted = true;
+        errorMsg.innerText = `${reason}。深度恢复已达上限；若声音仍异常，请重启该频道推流。`;
+        errorMsg.style.display = 'block';
+        return;
+    }
+
+    const elapsed = performance.now() - appState.previewLastHardRecoveryAt;
+    const cooldown = appState.previewLastHardRecoveryAt > 0
+        ? Math.max(0, PREVIEW_HARD_RECOVERY_COOLDOWN_MS - elapsed)
+        : 0;
+    const delay = Math.max(500, cooldown);
+    errorMsg.innerText = `${reason}，正在重建播放器...`;
+    errorMsg.style.display = 'block';
+
+    appState.hlsRetryTimer = window.setTimeout(() => {
+        appState.hlsRetryTimer = null;
+        if (token !== appState.previewToken) return;
+        appState.previewHardRecoveries++;
+        appState.previewLastHardRecoveryAt = performance.now();
+        createHlsPreviewPlayer(fullUrl, token);
+    }, delay);
+}
+
+function handleHlsPreviewError(hls, video, fullUrl, token, data) {
+    if (token !== appState.previewToken || hls !== appState.hlsPlayer) return;
+
+    const detail = data?.details || 'unknown';
+    const audioTimelineError = isPreviewAudioTimelineError(data);
+    const immediateReset = isPreviewImmediateResetError(data);
+    const severeMediaError = isPreviewSevereMediaError(data);
+
+    if (data?.fatal && data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        scheduleHlsPreviewReload(fullUrl, token, `直播网络中断 (${detail})`);
+        return;
+    }
+
+    if (!data?.fatal) {
+        if (detail === Hls.ErrorDetails.BUFFER_STALLED_ERROR) {
+            handlePreviewPlaybackStall(hls, video, fullUrl, token);
+            return;
+        }
+
+        if (audioTimelineError || immediateReset) {
+            logPreviewMediaWarning('检测到音频或时间轴异常', data);
+            scheduleHardPreviewRecovery(fullUrl, token, `音频时间轴异常 (${detail})`);
+            return;
+        }
+
+        if (severeMediaError)
+            recordPreviewSevereError(fullUrl, token, detail, data);
+        return;
+    }
+
+    if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !audioTimelineError && !immediateReset) {
+        const now = performance.now();
+        const cooldownElapsed = appState.previewLastMediaRecoveryAt === 0 ||
+            now - appState.previewLastMediaRecoveryAt >= PREVIEW_MEDIA_RECOVERY_COOLDOWN_MS;
+        if (appState.previewMediaRecoveries < PREVIEW_MAX_MEDIA_RECOVERIES && cooldownElapsed) {
+            appState.previewMediaRecoveries++;
+            appState.previewLastMediaRecoveryAt = now;
+            const errorMsg = document.getElementById('player-error-msg');
+            errorMsg.innerText = `媒体解码异常，正在重置 MediaSource (${detail})...`;
+            errorMsg.style.display = 'block';
+            hls.recoverMediaError();
+            return;
+        }
+    }
+
+    logPreviewMediaWarning('检测到致命媒体异常', data);
+    scheduleHardPreviewRecovery(fullUrl, token, `播放解码异常 (${detail})`);
+}
+
+function isPreviewAudioTimelineError(data) {
+    const message = [
+        data?.parent,
+        data?.sourceBufferName,
+        data?.details,
+        data?.reason,
+        data?.error?.message,
+        data?.err?.message
+    ].filter(Boolean).join(' ').toLowerCase();
+
+    return /(?:\baudio\b|\baac\b|mp4a|sample[ -]?rate|non.?monoton|timestamp|\bpts\b|\bdts\b)/i.test(message);
+}
+
+function isPreviewImmediateResetError(data) {
+    return data?.type === Hls.ErrorTypes.MUX_ERROR || [
+        Hls.ErrorDetails.BUFFER_INCOMPATIBLE_CODECS_ERROR,
+        Hls.ErrorDetails.MEDIA_SOURCE_REQUIRES_RESET,
+        Hls.ErrorDetails.ATTACH_MEDIA_ERROR
+    ].filter(Boolean).includes(data?.details);
+}
+
+function isPreviewSevereMediaError(data) {
+    return [
+        Hls.ErrorDetails.FRAG_PARSING_ERROR,
+        Hls.ErrorDetails.BUFFER_ADD_CODEC_ERROR,
+        Hls.ErrorDetails.BUFFER_APPEND_ERROR,
+        Hls.ErrorDetails.BUFFER_APPENDING_ERROR,
+        Hls.ErrorDetails.BUFFER_APPEND_NO_PROGRESS,
+        Hls.ErrorDetails.BUFFER_FULL_ERROR
+    ].filter(Boolean).includes(data?.details);
+}
+
+function recordPreviewSevereError(fullUrl, token, detail, data) {
+    const now = performance.now();
+    if (now - appState.previewLastSevereErrorAt > PREVIEW_SEVERE_ERROR_WINDOW_MS)
+        appState.previewSevereErrorCount = 0;
+
+    appState.previewLastSevereErrorAt = now;
+    appState.previewSevereErrorCount++;
+    logPreviewMediaWarning('检测到媒体缓冲异常', data);
+
+    if (appState.previewSevereErrorCount >= 2)
+        scheduleHardPreviewRecovery(fullUrl, token, `媒体缓冲持续异常 (${detail})`);
+}
+
+function logPreviewMediaWarning(message, data) {
+    console.warn(`[试播] ${message}`, {
+        type: data?.type,
+        details: data?.details,
+        reason: data?.reason || data?.error?.message,
+        parent: data?.parent,
+        sourceBufferName: data?.sourceBufferName,
+        sequence: data?.frag?.sn,
+        continuity: data?.frag?.cc
+    });
+}
+
+function detectPreviewAudioCodecChange(data, fullUrl, token) {
+    const track = data?.audio || data?.tracks?.audio;
+    if (!track) return;
+
+    const signatureParts = [track.container || '', track.codec || track.levelCodec || ''];
+    if (!signatureParts.some(Boolean)) return;
+    const signature = signatureParts.join('|');
+
+    if (appState.previewAudioCodecSignature && appState.previewAudioCodecSignature !== signature) {
+        console.warn('[试播] 音频编解码参数在播放期间发生变化', {
+            previous: appState.previewAudioCodecSignature,
+            current: signature
+        });
+        scheduleHardPreviewRecovery(fullUrl, token, '音频编解码参数发生变化');
+    }
+    appState.previewAudioCodecSignature = signature;
+}
+
+function detectPreviewTimestampDrift(data, fullUrl, token) {
+    if (appState.previewBufferedFragments < 2) return;
+
+    const drift = Math.abs(Number(data?.drift));
+    const continuity = data?.frag?.cc;
+    const sameContinuity = continuity != null && continuity === appState.previewLastFragContinuity;
+    if (Number.isFinite(drift) && drift > PREVIEW_TIMESTAMP_GAP_SECONDS && sameContinuity) {
+        console.warn('[试播] 检测到未标记的时间戳漂移', {
+            drift,
+            sequence: data?.frag?.sn,
+            continuity
+        });
+        scheduleHardPreviewRecovery(fullUrl, token, `媒体时间戳异常漂移 (${drift.toFixed(2)}s)`);
+    }
+}
+
+function inspectPreviewFragmentTimeline(data, fullUrl, token) {
+    const frag = data?.frag;
+    if (!frag || (data?.id && data.id !== 'main')) return;
+
+    const sequence = Number(frag.sn);
+    const continuity = frag.cc;
+    const parsedStartPts = toFinitePreviewNumber(frag.startPTS);
+    const startPts = parsedStartPts ?? toFinitePreviewNumber(frag.start);
+    const duration = Number(frag.duration);
+    const parsedEndPts = toFinitePreviewNumber(frag.endPTS);
+    const endPts = parsedEndPts ?? (Number.isFinite(startPts) && Number.isFinite(duration)
+        ? startPts + duration
+        : null);
+    const sequential = Number.isFinite(sequence) && Number.isFinite(appState.previewLastFragSequence) &&
+        sequence === appState.previewLastFragSequence + 1;
+    const sameContinuity = continuity != null && continuity === appState.previewLastFragContinuity;
+
+    if (sequential && sameContinuity && Number.isFinite(startPts) && Number.isFinite(appState.previewLastFragEndPts)) {
+        const gap = startPts - appState.previewLastFragEndPts;
+        if (Math.abs(gap) > PREVIEW_TIMESTAMP_GAP_SECONDS) {
+            console.warn('[试播] 相邻分片时间轴不连续', { gap, sequence, continuity });
+            scheduleHardPreviewRecovery(fullUrl, token, `相邻分片时间轴异常 (${gap.toFixed(2)}s)`);
+        }
+    }
+
+    appState.previewBufferedFragments++;
+    appState.previewLastFragSequence = Number.isFinite(sequence) ? sequence : null;
+    appState.previewLastFragContinuity = continuity ?? null;
+    appState.previewLastFragEndPts = Number.isFinite(endPts) ? endPts : null;
+}
+
+function toFinitePreviewNumber(value) {
+    if (value == null || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+}
+
+function resetPreviewGenerationState() {
+    appState.previewLastProgressAt = performance.now();
+    appState.previewLastTime = 0;
+    appState.previewLastSoftRecoveryAt = 0;
+    appState.previewSevereErrorCount = 0;
+    appState.previewLastSevereErrorAt = 0;
+    appState.previewBufferedFragments = 0;
+    appState.previewLastFragEndPts = null;
+    appState.previewLastFragSequence = null;
+    appState.previewLastFragContinuity = null;
+    appState.previewAudioCodecSignature = null;
+}
+
+function bindPreviewMediaProgressEvents(video, token) {
+    const markProgress = () => {
+        if (token !== appState.previewToken || video.paused) return;
+        const currentTime = video.currentTime;
+        if (!Number.isFinite(currentTime)) return;
+
+        if (currentTime > appState.previewLastTime + 0.05 || currentTime < appState.previewLastTime - 1) {
+            appState.previewLastTime = currentTime;
+            appState.previewLastProgressAt = performance.now();
+        }
+    };
+
+    video.ontimeupdate = markProgress;
+    video.onplaying = () => {
+        if (token !== appState.previewToken) return;
+        appState.previewLastTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+        appState.previewLastProgressAt = performance.now();
+    };
+}
+
+function handlePreviewPlaybackStall(hls, video, fullUrl, token) {
+    if (!hls || !video || video.paused || token !== appState.previewToken) return;
+
+    const now = performance.now();
+    const stalledFor = now - appState.previewLastProgressAt;
+    if (stalledFor >= PREVIEW_SOFT_STALL_RECOVERY_MS &&
+        now - appState.previewLastSoftRecoveryAt >= PREVIEW_SOFT_STALL_RECOVERY_MS) {
+        appState.previewLastSoftRecoveryAt = now;
+        recoverHlsPreviewToLiveEdge(hls, video);
+    }
+
+    if (stalledFor >= PREVIEW_HARD_STALL_RECOVERY_MS)
+        scheduleHardPreviewRecovery(fullUrl, token, '播放持续停滞');
+}
+
 function recoverHlsPreviewToLiveEdge(hls, video) {
     if (!hls || !video || video.paused) return;
 
@@ -1530,7 +1829,6 @@ function recoverHlsPreviewToLiveEdge(hls, video) {
 
     try { hls.startLoad(); } catch (_) {}
     video.play().catch(() => {});
-    appState.previewLastProgressAt = performance.now();
 }
 
 function recoverNativePreview(video) {
@@ -1559,9 +1857,27 @@ function startPreviewStallMonitor(token) {
             return;
         }
 
-        if (performance.now() - appState.previewLastProgressAt >= 8000)
-            recoverHlsPreviewToLiveEdge(hls, video);
+        handlePreviewPlaybackStall(hls, video, appState.previewUrl, token);
     }, 2000);
+}
+
+function destroyHlsPreviewInstance(video) {
+    const previousHls = appState.hlsPlayer;
+    // 先清除全局引用，使 destroy() 期间同步触发的旧代事件也会被代际校验拒绝。
+    appState.hlsPlayer = null;
+    if (previousHls) {
+        previousHls.destroy();
+    }
+
+    if (!video) return;
+    video.onloadedmetadata = null;
+    video.onstalled = null;
+    video.onerror = null;
+    video.ontimeupdate = null;
+    video.onplaying = null;
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
 }
 
 function resetPreviewPlayback() {
@@ -1569,21 +1885,7 @@ function resetPreviewPlayback() {
     window.clearInterval(appState.hlsStallTimer);
     appState.hlsRetryTimer = null;
     appState.hlsStallTimer = null;
-
-    if (appState.hlsPlayer) {
-        appState.hlsPlayer.destroy();
-        appState.hlsPlayer = null;
-    }
-
-    const video = document.getElementById('preview-video');
-    if (video) {
-        video.onloadedmetadata = null;
-        video.onstalled = null;
-        video.onerror = null;
-        video.pause();
-        video.removeAttribute('src');
-        video.load();
-    }
+    destroyHlsPreviewInstance(document.getElementById('preview-video'));
 }
 
 function closePreviewModal() {
