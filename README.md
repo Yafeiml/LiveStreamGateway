@@ -70,10 +70,10 @@
 <table width="100%">
   <thead>
     <tr>
-      <th width="95" align="left" nowrap>平台</th>
-      <th width="115" align="center" nowrap>状态</th>
-      <th width="165" align="center" nowrap>最高画质支持</th>
-      <th width="340" align="left" nowrap>说明</th>
+      <th width="120" align="left" nowrap>平台</th>
+      <th width="140" align="center" nowrap>状态</th>
+      <th width="195" align="center" nowrap>最高画质支持</th>
+      <th width="368" align="left" nowrap>说明</th>
     </tr>
   </thead>
   <tbody>
