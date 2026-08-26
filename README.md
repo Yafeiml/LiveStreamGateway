@@ -67,11 +67,36 @@
 
 ## 🛠️ 支持平台
 
-| 平台 | 状态 | 平台代号 (`Platform`) | 最高画质支持 | 说明 |
-| :--- | :---: | :---: | :---: | :--- |
-| **虎牙直播** | 🟢 完美支持 | `huya` | 4K / 原画 / 蓝光 | 支持动态反防盗链、自动重签、Cookie 鉴权 |
-| **斗鱼直播** | 🟢 完美支持 | `douyu` | 原画 / 蓝光 8M | 支持房间长短号解析、Cookie 鉴权 |
-| **哔哩哔哩** | 🟢 完美支持 | `bilibili` | 4K / 原画 1080P60 | 支持大会员高码率/高帧率流、Cookie 鉴权 |
+<table width="100%">
+  <thead>
+    <tr>
+      <th width="15%" align="left" nowrap>平台</th>
+      <th width="17%" align="center" nowrap>状态</th>
+      <th width="22%" align="center" nowrap>最高画质支持</th>
+      <th width="46%" align="left">说明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td align="left" nowrap><strong>虎牙直播</strong></td>
+      <td align="center" nowrap>🟢 完美支持</td>
+      <td align="center" nowrap>4K / 原画 / 蓝光</td>
+      <td align="left">支持动态反防盗链、自动重签、Cookie 鉴权</td>
+    </tr>
+    <tr>
+      <td align="left" nowrap><strong>斗鱼直播</strong></td>
+      <td align="center" nowrap>🟢 完美支持</td>
+      <td align="center" nowrap>原画 / 蓝光 8M</td>
+      <td align="left">支持房间长短号解析、Cookie 鉴权</td>
+    </tr>
+    <tr>
+      <td align="left" nowrap><strong>哔哩哔哩</strong></td>
+      <td align="center" nowrap>🟢 完美支持</td>
+      <td align="center" nowrap>4K / 原画 1080P60</td>
+      <td align="left">支持大会员高码率/高帧率流、Cookie 鉴权</td>
+    </tr>
+  </tbody>
+</table>
 
 ---
 
