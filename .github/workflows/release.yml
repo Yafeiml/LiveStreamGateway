@@ -39,6 +39,59 @@ jobs:
             echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
+      - name: Extract Current Version Release Notes
+        id: release_notes
+        shell: pwsh
+        run: |
+          $version = "${{ steps.get_version.outputs.VERSION }}"
+          $lines = @(Get-Content -LiteralPath "RELEASE_NOTES.md" -Encoding utf8)
+          $headingPattern = '^##\s+.*?(?<version>v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b'
+
+          $startIndex = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match $headingPattern -and $Matches['version'] -eq $version) {
+              $startIndex = $i
+              break
+            }
+          }
+
+          if ($startIndex -lt 0) {
+            throw "Release notes section for $version was not found in RELEASE_NOTES.md."
+          }
+
+          $endIndex = $lines.Count
+          for ($i = $startIndex + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match $headingPattern) {
+              $endIndex = $i
+              break
+            }
+          }
+
+          $section = [System.Collections.Generic.List[string]]::new()
+          for ($i = $startIndex; $i -lt $endIndex; $i++) {
+            $section.Add($lines[$i])
+          }
+
+          while ($section.Count -gt 0 -and [string]::IsNullOrWhiteSpace($section[$section.Count - 1])) {
+            $section.RemoveAt($section.Count - 1)
+          }
+          if ($section.Count -gt 0 -and $section[$section.Count - 1].Trim() -eq '---') {
+            $section.RemoveAt($section.Count - 1)
+          }
+          while ($section.Count -gt 0 -and [string]::IsNullOrWhiteSpace($section[$section.Count - 1])) {
+            $section.RemoveAt($section.Count - 1)
+          }
+
+          if ($section.Count -lt 2) {
+            throw "Release notes section for $version is empty."
+          }
+
+          $outputPath = Join-Path $env:RUNNER_TEMP "release-notes-$version.md"
+          $body = ($section -join "`n") + "`n"
+          [System.IO.File]::WriteAllText($outputPath, $body, [System.Text.UTF8Encoding]::new($false))
+          "path=$outputPath" >> $env:GITHUB_OUTPUT
+          Write-Host "Extracted $($section.Count) lines for $version."
+
       - name: Download FFmpeg Essentials
         shell: pwsh
         run: |
@@ -96,11 +149,11 @@ jobs:
         with:
           tag_name: ${{ steps.get_version.outputs.VERSION }}
           name: Release ${{ steps.get_version.outputs.VERSION }}
-          body_path: RELEASE_NOTES.md
+          body_path: ${{ steps.release_notes.outputs.path }}
           files: ./package/*
           draft: false
           prerelease: false
-          generate_release_notes: true
+          generate_release_notes: false
 
   build-docker:
     name: Build & Push Multi-Arch Docker Image
