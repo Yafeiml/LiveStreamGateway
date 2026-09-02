@@ -6,10 +6,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <ServerGarbageCollection>true</ServerGarbageCollection>
-    <Version>1.5.8</Version>
-    <AssemblyVersion>1.5.8</AssemblyVersion>
-    <FileVersion>1.5.8</FileVersion>
-    <DefaultItemExcludes>$(DefaultItemExcludes);dist\**</DefaultItemExcludes>
+    <Version>1.5.9</Version>
+    <AssemblyVersion>1.5.9</AssemblyVersion>
+    <FileVersion>1.5.9</FileVersion>
+    <DefaultItemExcludes>$(DefaultItemExcludes);dist\**;tests\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>

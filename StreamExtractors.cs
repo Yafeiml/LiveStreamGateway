@@ -647,11 +647,14 @@ namespace LiveStreamGateway
             try
             {
                 using var client = CreateHttpClient(timeoutSeconds: 8);
-                var req = new HttpRequestMessage(HttpMethod.Get, "https://www.douyu.com/wgapi/member/user/userInfo")
+                // 斗鱼旧的 /wgapi/member/user/userInfo 已返回 404。当前 Web 首页使用
+                // follow/top3 获取登录用户的关注数据：已登录返回 error=0，未登录返回 error=-1。
+                var req = new HttpRequestMessage(HttpMethod.Get, "https://www.douyu.com/wgapi/livenc/liveweb/follow/top3")
                 {
                     Version = HttpVersion.Version11
                 };
                 req.Headers.TryAddWithoutValidation("Referer", "https://www.douyu.com/");
+                req.Headers.TryAddWithoutValidation("Accept", "application/json, text/plain, */*");
                 req.Headers.TryAddWithoutValidation("Cookie", clean);
 
                 var res = await client.SendAsync(req);
@@ -665,26 +668,15 @@ namespace LiveStreamGateway
                 if (!res.IsSuccessStatusCode)
                 {
                     status.IsValid = false;
-                    status.IsNetworkError = false;
-                    status.Message = $"认证响应异常 (HTTP {(int)res.StatusCode})";
+                    status.IsNetworkError = true;
+                    status.Message = $"斗鱼认证接口暂时不可用 (HTTP {(int)res.StatusCode})";
                     return status;
                 }
 
-                var json = JsonNode.Parse(await res.Content.ReadAsStringAsync());
-                int error = json?["error"]?.GetValue<int>() ?? -1;
-                if (error == 0 && json?["data"] != null)
-                {
-                    status.IsValid = true;
-                    status.IsNetworkError = false;
-                    status.Username = json["data"]?["nickname"]?.GetValue<string>() ?? json["data"]?["username"]?.GetValue<string>() ?? "";
-                    status.Message = "已授权有效";
-                }
-                else
-                {
-                    status.IsValid = false;
-                    status.IsNetworkError = false;
-                    status.Message = "Cookie已失效或未登录";
-                }
+                ApplyDouyuVerificationResponse(
+                    status,
+                    clean,
+                    await res.Content.ReadAsStringAsync());
             }
             catch (Exception ex)
             {
@@ -693,6 +685,86 @@ namespace LiveStreamGateway
             }
 
             return status;
+        }
+
+        internal static void ApplyDouyuVerificationResponse(
+            PlatformCookieStatus status,
+            string cookieHeader,
+            string responseBody)
+        {
+            try
+            {
+                var json = JsonNode.Parse(responseBody);
+                bool hasErrorCode = int.TryParse(json?["error"]?.ToString(), out int error);
+                string upstreamMessage = json?["msg"]?.ToString() ?? "";
+
+                if (hasErrorCode && error == 0)
+                {
+                    status.IsValid = true;
+                    status.IsNetworkError = false;
+                    status.Username = GetDouyuUsernameFromCookie(cookieHeader);
+                    status.Message = "已授权有效";
+                }
+                else if ((hasErrorCode && error == -1)
+                    || upstreamMessage.Contains("未登录", StringComparison.OrdinalIgnoreCase)
+                    || upstreamMessage.Contains("未登陆", StringComparison.OrdinalIgnoreCase)
+                    || upstreamMessage.Contains("token已过期", StringComparison.OrdinalIgnoreCase))
+                {
+                    status.IsValid = false;
+                    status.IsNetworkError = false;
+                    status.Message = "Cookie已失效或未登录";
+                }
+                else
+                {
+                    status.IsValid = false;
+                    status.IsNetworkError = true;
+                    status.Message = hasErrorCode
+                        ? $"斗鱼认证响应异常 (error={error})"
+                        : "斗鱼认证响应格式异常";
+                }
+            }
+            catch (JsonException)
+            {
+                status.IsValid = false;
+                status.IsNetworkError = true;
+                status.Message = "斗鱼认证响应格式异常";
+            }
+        }
+
+        private static string GetDouyuUsernameFromCookie(string cookieHeader)
+        {
+            foreach (string key in new[] { "acf_nickname", "acf_username", "acf_uid" })
+            {
+                string value = GetCookieValue(cookieHeader, key);
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    return value;
+                }
+            }
+
+            return "";
+        }
+
+        private static string GetCookieValue(string cookieHeader, string key)
+        {
+            foreach (string part in cookieHeader.Split(';', StringSplitOptions.RemoveEmptyEntries))
+            {
+                int separatorIndex = part.IndexOf('=');
+                if (separatorIndex <= 0) continue;
+
+                string candidateKey = part[..separatorIndex].Trim();
+                if (!candidateKey.Equals(key, StringComparison.OrdinalIgnoreCase)) continue;
+
+                string encodedValue = part[(separatorIndex + 1)..].Trim();
+                string decodedValue = HttpUtility.UrlDecode(encodedValue, Encoding.UTF8) ?? encodedValue;
+                return new string(decodedValue
+                    .Where(c => !char.IsControl(c))
+                    .Take(80)
+                    .ToArray())
+                    .Trim();
+            }
+
+            return "";
         }
 
         public static async Task<PlatformCookieStatus> VerifyHuyaOnceAsync(string? cookies)

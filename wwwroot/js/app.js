@@ -1228,7 +1228,7 @@ function renderPlatformCookieCards() {
                 tag.innerHTML = `<span class="status-dot"></span><span class="status-text">${escapeHtml(userText)}</span>`;
             } else if (status && status.isNetworkError) {
                 tag.className = 'cookie-badge-status valid';
-                tag.innerHTML = `<span class="status-dot"></span><span class="status-text">已配置 (网络波动，保持状态)</span>`;
+                tag.innerHTML = `<span class="status-dot"></span><span class="status-text">已配置 (检测暂不可用，保持状态)</span>`;
             } else if (status && status.isValid === false) {
                 tag.className = 'cookie-badge-status expired';
                 tag.innerHTML = `<span class="status-dot"></span><span class="status-text">已过期: ${escapeHtml(status.message || '账号未登录')}</span>`;
