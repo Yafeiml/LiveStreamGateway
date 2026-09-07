@@ -507,7 +507,8 @@ app.MapGet("/api/channels/fetch-info", async (string? url, string? platform) =>
         else if (detectedPlatform == "douyu")
         {
             suggestedId = $"douyu_{roomId}";
-            string apiUrl = $"http://open.douyucdn.cn/api/RoomApi/room/{roomId}";
+            string canonicalRoomId = await DouyuRoomResolver.ResolveCanonicalRoomIdAsync(Globals.HttpClient, cleanUrl);
+            string apiUrl = $"https://open.douyucdn.cn/api/RoomApi/room/{canonicalRoomId}";
             using var req = new HttpRequestMessage(HttpMethod.Get, apiUrl);
             req.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
             
@@ -2258,7 +2259,7 @@ public class ChannelMetrics
 
 public static class Globals
 {
-    public const string APP_VERSION = "v1.5.9";
+    public const string APP_VERSION = "v1.6.0";
     public const int HTTP_PORT = 9898;
     public const string HLS_DIR = "hls_stream";
     public const int HLS_MANIFEST_FRESH_SECONDS = 30;
@@ -2684,13 +2685,11 @@ public class StreamManagerService : BackgroundService
         Globals.StreamManager = this;
     }
 
-    private static bool IsOfflineResult(string? error) =>
-        error?.Contains("未开播", StringComparison.OrdinalIgnoreCase) == true ||
-        error?.Contains("Not Live", StringComparison.OrdinalIgnoreCase) == true;
+    internal static bool IsOfflineResult(string? error) =>
+        error?.StartsWith("解析失败: Not Live", StringComparison.OrdinalIgnoreCase) == true;
 
     private static bool IsAuthenticationError(string? error) =>
-        error?.Contains("Cookie", StringComparison.OrdinalIgnoreCase) == true ||
-        error?.Contains("登录", StringComparison.OrdinalIgnoreCase) == true;
+        error?.StartsWith("解析失败: Cookie Invalid", StringComparison.OrdinalIgnoreCase) == true;
 
     private static string SafeLogValue(string? value)
     {
@@ -3307,8 +3306,10 @@ public class StreamManagerService : BackgroundService
                             else
                             {
                                 Globals.RecordError(channel.Id);
-                                Globals.UpdateState(channel.Id, ChannelState.Offline);
-                                Globals.UpdateStatus(channel.Id, string.IsNullOrEmpty(probeErr) ? "未开播" : probeErr, ConsoleColor.DarkYellow);
+                                string diagnostic = string.IsNullOrWhiteSpace(probeErr) ? "直播源解析失败" : probeErr;
+                                Globals.UpdateState(channel.Id, ChannelState.Error);
+                                Globals.UpdateStatus(channel.Id, diagnostic, ConsoleColor.Red);
+                                LogLifecycle(channel.Id, "source-unavailable", $"category=extractor reason={diagnostic}");
                             }
                         }
                     }
@@ -3685,7 +3686,8 @@ public class StreamManagerService : BackgroundService
             if (!isOfflineResult)
             {
                 Globals.RecordError(channel.Id);
-                LogLifecycle(channel.Id, "source-unavailable", $"category={(IsAuthenticationError(error) ? "authentication" : "extractor")}");
+                string category = IsAuthenticationError(error) ? "authentication" : "extractor";
+                LogLifecycle(channel.Id, "source-unavailable", $"category={category} reason={error}");
             }
             return;
         }
@@ -3736,7 +3738,7 @@ public class StreamManagerService : BackgroundService
             string? url = await extractor.GetStreamUrlAsync(channel.Url ?? "", channel.Quality ?? "OD");
             return !string.IsNullOrEmpty(url)
                 ? (url, null)
-                : (null, "未获取到直播流地址 (可能未开播或需要Cookie)");
+                : (null, "解析器未返回直播流地址");
         }
         catch (OperationCanceledException)
         {

@@ -185,37 +185,116 @@ namespace LiveStreamGateway
         }
     }
 
+    internal static class DouyuRoomResolver
+    {
+        private const string UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36";
+
+        internal static async Task<string> ResolveCanonicalRoomIdAsync(
+            HttpClient httpClient,
+            string url,
+            CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(httpClient);
+
+            string input = (url ?? "").Trim();
+            if (string.IsNullOrEmpty(input))
+                throw new InvalidOperationException("斗鱼直播间地址不能为空");
+
+            // 带 rid 查询参数的地址已经明确给出了斗鱼内部房间 ID。
+            var explicitRid = Regex.Match(input, @"(?:[?&]|&amp;)rid=(\d+)", RegexOptions.IgnoreCase);
+            if (explicitRid.Success)
+                return explicitRid.Groups[1].Value;
+
+            string? pagePath = ExtractRoomPath(input);
+            string? fallbackRoomId = pagePath != null && Regex.IsMatch(pagePath, @"^\d+$")
+                ? pagePath
+                : null;
+
+            if (string.IsNullOrEmpty(pagePath))
+                throw new InvalidOperationException("无法从斗鱼地址中识别房间号");
+
+            try
+            {
+                using var request = new HttpRequestMessage(
+                    HttpMethod.Get,
+                    $"https://m.douyu.com/{Uri.EscapeDataString(pagePath)}");
+                request.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
+
+                using var response = await httpClient.SendAsync(request, cancellationToken);
+                if (response.IsSuccessStatusCode)
+                {
+                    string html = await response.Content.ReadAsStringAsync(cancellationToken);
+                    string? canonicalRoomId = ExtractCanonicalRoomId(html);
+                    if (!string.IsNullOrEmpty(canonicalRoomId))
+                        return canonicalRoomId;
+                }
+                else if (string.IsNullOrEmpty(fallbackRoomId))
+                {
+                    throw new HttpRequestException($"斗鱼房间页面请求失败 (HTTP {(int)response.StatusCode})");
+                }
+            }
+            catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested && !string.IsNullOrEmpty(fallbackRoomId))
+            {
+                // 页面解析超时时，真实数字房间号仍可直接交给播放接口，避免网络抖动造成回归。
+            }
+            catch (HttpRequestException) when (!string.IsNullOrEmpty(fallbackRoomId))
+            {
+                // 同上：只对可安全回退的纯数字房间号降级。
+            }
+
+            if (!string.IsNullOrEmpty(fallbackRoomId))
+                return fallbackRoomId;
+
+            throw new InvalidOperationException($"无法解析斗鱼房间 {pagePath} 的真实 rid");
+        }
+
+        internal static string? ExtractCanonicalRoomId(string? html)
+        {
+            if (string.IsNullOrWhiteSpace(html)) return null;
+
+            // 同时兼容页面中的 `"rid":6979222`、`"rid":"6979222"`
+            // 以及嵌入字符串后带反斜杠转义的 `\"rid\":6979222`。
+            var match = Regex.Match(
+                html,
+                @"\\?""rid\\?""\s*:\s*\\?""?(\d+)",
+                RegexOptions.IgnoreCase);
+            return match.Success ? match.Groups[1].Value : null;
+        }
+
+        private static string? ExtractRoomPath(string input)
+        {
+            if (Regex.IsMatch(input, @"^\d+$"))
+                return input;
+
+            if (Uri.TryCreate(input, UriKind.Absolute, out var uri) &&
+                (uri.Host.Equals("douyu.com", StringComparison.OrdinalIgnoreCase) ||
+                 uri.Host.EndsWith(".douyu.com", StringComparison.OrdinalIgnoreCase)))
+            {
+                string path = uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+                return string.IsNullOrEmpty(path) ? null : Uri.UnescapeDataString(path);
+            }
+
+            var match = Regex.Match(
+                input,
+                @"(?:https?://)?(?:www\.|m\.)?douyu\.com/([^/?#]+)",
+                RegexOptions.IgnoreCase);
+            return match.Success ? Uri.UnescapeDataString(match.Groups[1].Value) : null;
+        }
+    }
+
     public class DouyuExtractor : BaseExtractor
     {
+        private const string UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36";
+
         public DouyuExtractor(string? cookies) : base(cookies) { }
 
         public override async Task<string?> GetStreamUrlAsync(string url, string quality)
         {
             try
             {
-                string roomId = "";
-                var match = Regex.Match(url, @"douyu\.com/(\d+)");
-                if (match.Success) roomId = match.Groups[1].Value;
-                else
-                {
-                    match = Regex.Match(url, @"rid=(\d+)");
-                    if (match.Success) roomId = match.Groups[1].Value;
-                }
-                
-                if (string.IsNullOrEmpty(roomId))
-                {
-                    string path = url.Split(new[] { "douyu.com/" }, StringSplitOptions.None)[1].Split('?')[0].Split('/')[0];
-                    var req = new HttpRequestMessage(HttpMethod.Get, $"https://m.douyu.com/{path}");
-                    req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36");
-                    if (!string.IsNullOrEmpty(_cookies)) req.Headers.TryAddWithoutValidation("Cookie", _cookies);
-                    
-                    var res = await _httpClient.SendAsync(req);
-                    var html = await res.Content.ReadAsStringAsync();
-                    var m = Regex.Match(html, @"""rid"":(\d+)");
-                    if (m.Success) roomId = m.Groups[1].Value;
-                }
-
-                if (string.IsNullOrEmpty(roomId)) return null;
+                // 斗鱼数字路径既可能是真实 rid，也可能是数字靓号。始终先读取移动页，
+                // 将 6657 这类展示号转换为真实 rid 后再参与签名和取流。
+                string roomId = await DouyuRoomResolver.ResolveCanonicalRoomIdAsync(_httpClient, url);
 
                 string rate = quality switch
                 {
@@ -230,17 +309,25 @@ namespace LiveStreamGateway
 
                 // 1. 获取动态加密密钥 (带 Cookie 鉴权)
                 var encReq = new HttpRequestMessage(HttpMethod.Get, $"https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did=10000000000000000000000000001501");
-                encReq.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36");
+                encReq.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
                 encReq.Headers.TryAddWithoutValidation("Referer", $"https://www.douyu.com/{roomId}");
                 if (!string.IsNullOrEmpty(_cookies)) encReq.Headers.TryAddWithoutValidation("Cookie", _cookies);
                 
-                var encRes = await _httpClient.SendAsync(encReq);
-                var encJson = JsonNode.Parse(await encRes.Content.ReadAsStringAsync());
-                
-                if (encJson?["error"]?.GetValue<int>() != 0)
-                    throw new Exception("Douyu encryption fetch failed.");
+                using var encRes = await _httpClient.SendAsync(encReq);
+                string encBody = await encRes.Content.ReadAsStringAsync();
+                if (!encRes.IsSuccessStatusCode)
+                    throw new Exception($"加密参数接口请求失败 (HTTP {(int)encRes.StatusCode})");
 
-                var white = encJson["data"];
+                var encJson = JsonNode.Parse(encBody);
+                int encError = TryReadInt(encJson?["error"], out int parsedEncError) ? parsedEncError : -1;
+                if (encError != 0)
+                {
+                    string encMessage = NormalizeUpstreamMessage(encJson?["msg"]?.ToString());
+                    throw new Exception($"加密参数接口返回异常 (error={encError}, msg={encMessage})");
+                }
+
+                var white = encJson?["data"]
+                    ?? throw new Exception("加密参数接口响应缺少 data 字段");
                 long ts = GetTimestampUnix();
                 string secret = white?["rand_str"]?.GetValue<string>() ?? "";
                 
@@ -282,42 +369,67 @@ namespace LiveStreamGateway
 
                 // 2. 请求播放地址 (带全量 Cookie，解锁原画2K60/4K与最高码率)
                 var playReq = new HttpRequestMessage(HttpMethod.Post, $"https://playweb.douyucdn.cn/lapi/live/getH5PlayV1/{roomId}");
-                playReq.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36");
+                playReq.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
                 playReq.Headers.TryAddWithoutValidation("Origin", "https://www.douyu.com");
                 playReq.Headers.TryAddWithoutValidation("Referer", $"https://www.douyu.com/{roomId}");
                 if (!string.IsNullOrEmpty(_cookies)) playReq.Headers.TryAddWithoutValidation("Cookie", _cookies);
                 playReq.Content = new FormUrlEncodedContent(paramDict);
 
-                var playRes = await _httpClient.SendAsync(playReq);
-                var playJson = JsonNode.Parse(await playRes.Content.ReadAsStringAsync());
-                
-                int errCode = playJson?["error"]?.GetValue<int>() ?? -1;
-                if (errCode == 0)
-                {
-                    var data = playJson?["data"];
-                    string rtmpUrl = data?["rtmp_url"]?.GetValue<string>() ?? "";
-                    string rtmpLive = data?["rtmp_live"]?.GetValue<string>() ?? "";
-                    if (!string.IsNullOrEmpty(rtmpUrl) && !string.IsNullOrEmpty(rtmpLive))
-                    {
-                        return $"{rtmpUrl}/{rtmpLive}";
-                    }
-                }
-                else if (errCode == 102 || errCode == 104)
-                {
-                    throw new Exception("Not Live (未开播)");
-                }
-                else if (errCode == -5 || errCode == 51)
-                {
-                    throw new Exception("Cookie Invalid (Cookie失效或需登录)");
-                }
+                using var playRes = await _httpClient.SendAsync(playReq);
+                string playBody = await playRes.Content.ReadAsStringAsync();
+                if (!playRes.IsSuccessStatusCode)
+                    throw new Exception($"播放接口请求失败 (rid={roomId}, HTTP {(int)playRes.StatusCode})");
 
-                throw new Exception("Not Live (未开播)");
+                var playJson = JsonNode.Parse(playBody);
+                return ExtractStreamUrlOrThrow(playJson, roomId);
             }
             catch (Exception ex)
             {
                 if (ex.Message.Contains("Not Live") || ex.Message.Contains("Cookie Invalid")) throw;
                 throw new Exception($"Douyu Error: {ex.Message}");
             }
+        }
+
+        internal static string ExtractStreamUrlOrThrow(JsonNode? playJson, string roomId)
+        {
+            if (!TryReadInt(playJson?["error"], out int errCode))
+                throw new Exception($"播放接口响应缺少有效 error 字段 (rid={roomId})");
+
+            string upstreamMessage = NormalizeUpstreamMessage(playJson?["msg"]?.ToString());
+            if (errCode == 0)
+            {
+                var data = playJson?["data"];
+                string rtmpUrl = data?["rtmp_url"]?.GetValue<string>() ?? "";
+                string rtmpLive = data?["rtmp_live"]?.GetValue<string>() ?? "";
+                if (!string.IsNullOrEmpty(rtmpUrl) && !string.IsNullOrEmpty(rtmpLive))
+                    return $"{rtmpUrl.TrimEnd('/')}/{rtmpLive.TrimStart('/')}";
+
+                throw new Exception($"播放接口未返回有效直播流地址 (rid={roomId}, error=0)");
+            }
+
+            if (errCode == 102 || errCode == 104)
+                throw new Exception($"Not Live (未开播; rid={roomId}, error={errCode}, msg={upstreamMessage})");
+
+            if (errCode == -5 || errCode == 51)
+                throw new Exception($"Cookie Invalid (Cookie失效或需登录; rid={roomId}, error={errCode}, msg={upstreamMessage})");
+
+            // 未知错误必须保留真实错误码，不能再伪装成“未开播”。
+            throw new Exception($"播放接口返回异常 (rid={roomId}, error={errCode}, msg={upstreamMessage})");
+        }
+
+        private static bool TryReadInt(JsonNode? node, out int value)
+        {
+            value = 0;
+            if (node is not JsonValue jsonValue) return false;
+            if (jsonValue.TryGetValue<int>(out value)) return true;
+            return int.TryParse(node.ToString(), out value);
+        }
+
+        private static string NormalizeUpstreamMessage(string? message)
+        {
+            string clean = Regex.Replace(message ?? "", @"\s+", " ").Trim();
+            if (string.IsNullOrEmpty(clean)) return "unknown";
+            return clean.Length <= 120 ? clean : clean[..120];
         }
     }
 
