@@ -407,11 +407,19 @@ namespace LiveStreamGateway
                 throw new Exception($"播放接口未返回有效直播流地址 (rid={roomId}, error=0)");
             }
 
-            if (errCode == 102 || errCode == 104)
+            // 斗鱼会对离线房间返回 error=-5、msg=房间未开播。消息语义优先，
+            // 避免把有效 Cookie 下的正常离线状态误报为 Cookie 失效。
+            if (errCode == 102 || errCode == 104 || IsOfflineMessage(upstreamMessage))
                 throw new Exception($"Not Live (未开播; rid={roomId}, error={errCode}, msg={upstreamMessage})");
 
-            if (errCode == -5 || errCode == 51)
+            // 只有上游明确表达登录或凭据失效时才归类为鉴权错误。
+            // error=51 的具体语义并不稳定，不能仅凭错误码猜测 Cookie 已失效。
+            if (IsAuthenticationMessage(upstreamMessage))
                 throw new Exception($"Cookie Invalid (Cookie失效或需登录; rid={roomId}, error={errCode}, msg={upstreamMessage})");
+
+            // 当前播放接口在消息缺失时也可能仅用 -5 表示离线，保留兼容兜底。
+            if (errCode == -5)
+                throw new Exception($"Not Live (未开播; rid={roomId}, error={errCode}, msg={upstreamMessage})");
 
             // 未知错误必须保留真实错误码，不能再伪装成“未开播”。
             throw new Exception($"播放接口返回异常 (rid={roomId}, error={errCode}, msg={upstreamMessage})");
@@ -430,6 +438,35 @@ namespace LiveStreamGateway
             string clean = Regex.Replace(message ?? "", @"\s+", " ").Trim();
             if (string.IsNullOrEmpty(clean)) return "unknown";
             return clean.Length <= 120 ? clean : clean[..120];
+        }
+
+        private static bool IsOfflineMessage(string message) =>
+            message.Contains("未开播", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("已下播", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("直播已结束", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("直播结束", StringComparison.OrdinalIgnoreCase);
+
+        private static bool IsAuthenticationMessage(string message)
+        {
+            if (message.Contains("Cookie", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("未登录", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("未登陆", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("请登录", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("请登陆", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("登录失效", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("登陆失效", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("需要登录", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("需要登陆", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            bool mentionsToken = message.Contains("token", StringComparison.OrdinalIgnoreCase);
+            bool tokenInvalid = message.Contains("过期", StringComparison.OrdinalIgnoreCase) ||
+                                message.Contains("失效", StringComparison.OrdinalIgnoreCase) ||
+                                message.Contains("invalid", StringComparison.OrdinalIgnoreCase) ||
+                                message.Contains("expired", StringComparison.OrdinalIgnoreCase);
+            return mentionsToken && tokenInvalid;
         }
     }
 

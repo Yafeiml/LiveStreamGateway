@@ -2259,7 +2259,7 @@ public class ChannelMetrics
 
 public static class Globals
 {
-    public const string APP_VERSION = "v1.6.0";
+    public const string APP_VERSION = "v1.6.1";
     public const int HTTP_PORT = 9898;
     public const string HLS_DIR = "hls_stream";
     public const int HLS_MANIFEST_FRESH_SECONDS = 30;
@@ -2688,7 +2688,7 @@ public class StreamManagerService : BackgroundService
     internal static bool IsOfflineResult(string? error) =>
         error?.StartsWith("解析失败: Not Live", StringComparison.OrdinalIgnoreCase) == true;
 
-    private static bool IsAuthenticationError(string? error) =>
+    internal static bool IsAuthenticationError(string? error) =>
         error?.StartsWith("解析失败: Cookie Invalid", StringComparison.OrdinalIgnoreCase) == true;
 
     private static string SafeLogValue(string? value)

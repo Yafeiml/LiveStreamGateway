@@ -81,6 +81,55 @@ public class DouyuExtractorTests
         Assert.True(StreamManagerService.IsOfflineResult($"解析失败: {exception.Message}"));
     }
 
+    [Theory]
+    [InlineData("房间未开播")]
+    [InlineData("")]
+    public void MinusFiveOfflineResponse_IsNotMisclassifiedAsCookieInvalid(string message)
+    {
+        var response = JsonNode.Parse($"{{\"error\":-5,\"msg\":\"{message}\"}}");
+
+        var exception = Assert.Throws<Exception>(() =>
+            DouyuExtractor.ExtractStreamUrlOrThrow(response, "6979222"));
+        string error = $"解析失败: {exception.Message}";
+
+        Assert.Contains("Not Live", exception.Message);
+        Assert.Contains("error=-5", exception.Message);
+        Assert.True(StreamManagerService.IsOfflineResult(error));
+        Assert.False(StreamManagerService.IsAuthenticationError(error));
+    }
+
+    [Theory]
+    [InlineData(-5, "用户未登录")]
+    [InlineData(51, "token已过期")]
+    public void ExplicitAuthenticationMessage_IsClassifiedAsCookieInvalid(int errorCode, string message)
+    {
+        var response = JsonNode.Parse($"{{\"error\":{errorCode},\"msg\":\"{message}\"}}");
+
+        var exception = Assert.Throws<Exception>(() =>
+            DouyuExtractor.ExtractStreamUrlOrThrow(response, "6979222"));
+        string error = $"解析失败: {exception.Message}";
+
+        Assert.Contains("Cookie Invalid", exception.Message);
+        Assert.Contains($"error={errorCode}", exception.Message);
+        Assert.False(StreamManagerService.IsOfflineResult(error));
+        Assert.True(StreamManagerService.IsAuthenticationError(error));
+    }
+
+    [Fact]
+    public void AmbiguousCode51_IsPreservedAsExtractorError()
+    {
+        var response = JsonNode.Parse("{\"error\":51,\"msg\":\"请求暂时失败\"}");
+
+        var exception = Assert.Throws<Exception>(() =>
+            DouyuExtractor.ExtractStreamUrlOrThrow(response, "6979222"));
+        string error = $"解析失败: Douyu Error: {exception.Message}";
+
+        Assert.Contains("error=51", exception.Message);
+        Assert.DoesNotContain("Cookie Invalid", exception.Message);
+        Assert.False(StreamManagerService.IsOfflineResult(error));
+        Assert.False(StreamManagerService.IsAuthenticationError(error));
+    }
+
     [Fact]
     public void UnknownPlayError_PreservesCodeAndIsNotClassifiedAsOffline()
     {
