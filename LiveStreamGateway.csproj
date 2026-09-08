@@ -6,9 +6,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <ServerGarbageCollection>true</ServerGarbageCollection>
-    <Version>1.6.1</Version>
-    <AssemblyVersion>1.6.1</AssemblyVersion>
-    <FileVersion>1.6.1</FileVersion>
+    <Version>1.6.2</Version>
+    <AssemblyVersion>1.6.2</AssemblyVersion>
+    <FileVersion>1.6.2</FileVersion>
     <DefaultItemExcludes>$(DefaultItemExcludes);dist\**;tests\**</DefaultItemExcludes>
   </PropertyGroup>
 

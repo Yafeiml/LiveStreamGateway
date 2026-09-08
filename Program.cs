@@ -797,7 +797,59 @@ app.MapPost("/api/channels", async (ChannelConfig newChannel) =>
     return Results.Ok(new { success = true, channel = newChannel });
 });
 
-// 4. 删除频道
+// 4. 持久化频道卡片顺序（仅调整列表顺序，不重启任何推流进程）
+app.MapPost("/api/channels/reorder", async (ChannelOrderRequest request) =>
+{
+    List<ChannelConfig> previousOrder;
+    List<ChannelConfig> reorderedChannels;
+    string[] reorderedIds;
+
+    lock (Globals.ConfigLock)
+    {
+        previousOrder = [.. Globals.Config.Channels];
+        if (!ChannelOrdering.TryBuild(
+                previousOrder,
+                request.ChannelIds,
+                out reorderedChannels,
+                out string validationError))
+        {
+            return Results.BadRequest(new { error = validationError });
+        }
+
+        reorderedIds = [.. reorderedChannels.Select(channel => channel.Id)];
+        bool changed = !previousOrder
+            .Select(channel => channel.Id)
+            .SequenceEqual(reorderedIds, StringComparer.Ordinal);
+        if (!changed)
+        {
+            return Results.Ok(new { success = true, changed = false, channelIds = reorderedIds });
+        }
+
+        Globals.Config.Channels = reorderedChannels;
+    }
+
+    if (!await SaveConfigAsync())
+    {
+        lock (Globals.ConfigLock)
+        {
+            // 仅当期间没有其它频道操作改写列表时回滚，避免覆盖并发的新增或删除。
+            if (Globals.Config.Channels
+                .Select(channel => channel.Id)
+                .SequenceEqual(reorderedIds, StringComparer.Ordinal))
+            {
+                Globals.Config.Channels = previousOrder;
+            }
+        }
+
+        return Results.Json(
+            new { error = "频道顺序写入失败，原顺序已保留" },
+            statusCode: StatusCodes.Status500InternalServerError);
+    }
+
+    return Results.Ok(new { success = true, changed = true, channelIds = reorderedIds });
+});
+
+// 5. 删除频道
 app.MapDelete("/api/channels/{id}", async (string id) =>
 {
     ChannelConfig? removed = null;
@@ -831,7 +883,7 @@ app.MapDelete("/api/channels/{id}", async (string id) =>
     return Results.NotFound(new { error = "未找到指定频道" });
 });
 
-// 5. 一键切换频道启用/禁用状态
+// 6. 一键切换频道启用/禁用状态
 app.MapPost("/api/channels/{id}/toggle", async (string id) =>
 {
     bool newState = false;
@@ -851,7 +903,7 @@ app.MapPost("/api/channels/{id}/toggle", async (string id) =>
     return Results.Ok(new { success = true, id, enable = newState });
 });
 
-// 6. 手动重启指定频道流
+// 7. 手动重启指定频道流
 app.MapPost("/api/channels/{id}/restart", async (string id) =>
 {
     var channel = Globals.Config.Channels.FirstOrDefault(c => c.Id == id);
@@ -864,7 +916,7 @@ app.MapPost("/api/channels/{id}/restart", async (string id) =>
     return Results.Ok(new { success = true, message = $"已触发频道 {channel.Name} 重启" });
 });
 
-// 7. 保存指定平台 Cookie (huya, douyu, bilibili) 并自动检测有效性
+// 8. 保存指定平台 Cookie (huya, douyu, bilibili) 并自动检测有效性
 app.MapPost("/api/cookies", async (CookieProfileRequest req) =>
 {
     if (string.IsNullOrWhiteSpace(req.Key))
@@ -891,7 +943,7 @@ app.MapPost("/api/cookies", async (CookieProfileRequest req) =>
     return Results.Ok(new { success = true, key, configured = !string.IsNullOrWhiteSpace(req.Cookie), status, statuses = Globals.PlatformCookieStatuses });
 });
 
-// 8. 清空指定平台 Cookie
+// 9. 清空指定平台 Cookie
 app.MapDelete("/api/cookies/{key}", async (string key) =>
 {
     string k = (key ?? "").Trim().ToLower();
@@ -918,7 +970,7 @@ app.MapDelete("/api/cookies/{key}", async (string key) =>
     return Results.Ok(new { success = true, message = $"已清空平台 '{k}' 的 Cookie", statuses = Globals.PlatformCookieStatuses });
 });
 
-// 9. 手动检测平台 Cookie 有效性
+// 10. 手动检测平台 Cookie 有效性
 app.MapPost("/api/cookies/verify", async (HttpRequest request) =>
 {
     string? platform = request.Query["platform"].ToString()?.Trim()?.ToLower();
@@ -934,13 +986,13 @@ app.MapPost("/api/cookies/verify", async (HttpRequest request) =>
     }
 });
 
-// 10. 获取各平台 Cookie 实时健康状态
+// 11. 获取各平台 Cookie 实时健康状态
 app.MapGet("/api/cookies/status", () =>
 {
     return Results.Ok(Globals.PlatformCookieStatuses);
 });
 
-// 11. 设置/保存自定义局域网主机 IP 或域名
+// 12. 设置/保存自定义局域网主机 IP 或域名
 app.MapPost("/api/config/host", async (JsonNode body) =>
 {
     string host = body?["customHost"]?.GetValue<string>()?.Trim() ?? "";
@@ -1939,6 +1991,75 @@ public class ChannelConfig
     public bool Enable { get; set; } = true;
 }
 
+public sealed class ChannelOrderRequest
+{
+    public List<string>? ChannelIds { get; set; }
+}
+
+internal static class ChannelOrdering
+{
+    internal static bool TryBuild(
+        IReadOnlyList<ChannelConfig> currentChannels,
+        IReadOnlyList<string>? requestedIds,
+        out List<ChannelConfig> reorderedChannels,
+        out string error)
+    {
+        reorderedChannels = [];
+        error = string.Empty;
+
+        if (requestedIds == null)
+        {
+            error = "频道顺序不能为空";
+            return false;
+        }
+
+        if (requestedIds.Count != currentChannels.Count)
+        {
+            error = "排序请求必须包含全部频道，且不能增加或遗漏频道";
+            return false;
+        }
+
+        var channelsById = new Dictionary<string, ChannelConfig>(StringComparer.Ordinal);
+        foreach (ChannelConfig channel in currentChannels)
+        {
+            if (string.IsNullOrWhiteSpace(channel.Id) || !channelsById.TryAdd(channel.Id, channel))
+            {
+                error = "当前频道配置包含空 ID 或重复 ID，无法安全排序";
+                return false;
+            }
+        }
+
+        var seenIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string? channelId in requestedIds)
+        {
+            if (string.IsNullOrWhiteSpace(channelId))
+            {
+                error = "排序请求包含空频道 ID";
+                reorderedChannels = [];
+                return false;
+            }
+
+            if (!seenIds.Add(channelId))
+            {
+                error = "排序请求包含重复频道 ID";
+                reorderedChannels = [];
+                return false;
+            }
+
+            if (!channelsById.TryGetValue(channelId, out ChannelConfig? channel))
+            {
+                error = "排序请求包含不存在的频道";
+                reorderedChannels = [];
+                return false;
+            }
+
+            reorderedChannels.Add(channel);
+        }
+
+        return true;
+    }
+}
+
 public class ChannelStatus
 {
     public string Id { get; set; } = string.Empty;
@@ -2259,7 +2380,7 @@ public class ChannelMetrics
 
 public static class Globals
 {
-    public const string APP_VERSION = "v1.6.1";
+    public const string APP_VERSION = "v1.6.2";
     public const int HTTP_PORT = 9898;
     public const string HLS_DIR = "hls_stream";
     public const int HLS_MANIFEST_FRESH_SECONDS = 30;

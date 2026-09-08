@@ -31,6 +31,8 @@ let appState = {
     previewRecoveryExhausted: false,
     pollTimer: null,
     urlDebounceTimer: null,
+    channelDrag: null,
+    channelOrderSaving: false,
     authenticated: false,
     setupRequired: false,
     managementStarted: false,
@@ -100,6 +102,10 @@ function setupEventListeners() {
     document.getElementById('btn-add-channel')?.addEventListener('click', () => {
         openAddChannelModal();
     });
+
+    const channelsContainer = document.getElementById('channels-container');
+    channelsContainer?.addEventListener('pointerdown', beginChannelDrag);
+    channelsContainer?.addEventListener('keydown', handleChannelOrderKeydown);
 
     // Manage Cookies Button
     document.getElementById('btn-manage-cookies')?.addEventListener('click', () => {
@@ -672,6 +678,9 @@ function renderDashboard() {
 
     // Render channels
     const container = document.getElementById('channels-container');
+    // 拖动或写入顺序期间保留当前 DOM，避免 3 秒状态轮询把手势中的卡片重建。
+    if (appState.channelDrag || appState.channelOrderSaving) return;
+
     if (!s.channels || s.channels.length === 0) {
         container.innerHTML = `
             <div class="loading-placeholder">
@@ -682,10 +691,11 @@ function renderDashboard() {
         return;
     }
 
-    container.innerHTML = s.channels.map(ch => createChannelCardHtml(ch)).join('');
+    const canReorder = s.channels.length > 1;
+    container.innerHTML = s.channels.map(ch => createChannelCardHtml(ch, canReorder)).join('');
 }
 
-function createChannelCardHtml(ch) {
+function createChannelCardHtml(ch, canReorder = true) {
     const platformClass = `platform-${ch.platform?.toLowerCase() || 'huya'}`;
     const platformName = getPlatformDisplayName(ch.platform);
 
@@ -771,10 +781,24 @@ function createChannelCardHtml(ch) {
            </button>`;
 
     return `
-        <div class="channel-card ${ch.enable ? '' : 'disabled'}" id="card-${ch.id}">
+        <div class="channel-card ${ch.enable ? '' : 'disabled'}" id="card-${ch.id}" data-channel-id="${escapeHtml(ch.id)}">
             <div>
                 <div class="channel-header">
                     <div class="channel-title-wrap">
+                        <button type="button"
+                                class="channel-drag-handle"
+                                title="拖动调整频道顺序；也可使用方向键"
+                                aria-label="调整 ${escapeHtml(ch.name)} 的显示顺序"
+                                ${canReorder ? '' : 'disabled'}>
+                            <svg viewBox="0 0 20 20" width="18" height="18" fill="currentColor" aria-hidden="true">
+                                <circle cx="7" cy="5" r="1.4"></circle>
+                                <circle cx="13" cy="5" r="1.4"></circle>
+                                <circle cx="7" cy="10" r="1.4"></circle>
+                                <circle cx="13" cy="10" r="1.4"></circle>
+                                <circle cx="7" cy="15" r="1.4"></circle>
+                                <circle cx="13" cy="15" r="1.4"></circle>
+                            </svg>
+                        </button>
                         <span class="platform-pill ${platformClass}">${platformName}</span>
                         <h3 class="channel-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</h3>
                     </div>
@@ -832,6 +856,286 @@ function createChannelCardHtml(ch) {
             </div>
         </div>
     `;
+}
+
+function getRenderedChannelCards(container = document.getElementById('channels-container')) {
+    if (!container) return [];
+    return Array.from(container.children)
+        .filter(element => element.classList?.contains('channel-card') && element.dataset.channelId);
+}
+
+function getRenderedChannelOrder(container = document.getElementById('channels-container')) {
+    return getRenderedChannelCards(container).map(card => card.dataset.channelId);
+}
+
+function beginChannelDrag(event) {
+    const target = event.target instanceof Element ? event.target : null;
+    const handle = target?.closest('.channel-drag-handle');
+    if (!handle || handle.disabled || appState.channelOrderSaving || appState.channelDrag) return;
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+
+    const card = handle.closest('.channel-card');
+    const container = card?.parentElement;
+    if (!card || container?.id !== 'channels-container' || getRenderedChannelCards(container).length < 2) return;
+
+    event.preventDefault();
+    const rect = card.getBoundingClientRect();
+    appState.channelDrag = {
+        pointerId: event.pointerId,
+        handle,
+        card,
+        container,
+        active: false,
+        ghost: null,
+        startX: event.clientX,
+        startY: event.clientY,
+        offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top,
+        initialOrder: getRenderedChannelOrder(container)
+    };
+
+    try { handle.setPointerCapture(event.pointerId); } catch (_) { }
+    window.addEventListener('pointermove', moveChannelDrag, { passive: false });
+    window.addEventListener('pointerup', completeChannelDrag);
+    window.addEventListener('pointercancel', cancelChannelDrag);
+    window.addEventListener('keydown', cancelChannelDragWithEscape, true);
+}
+
+function moveChannelDrag(event) {
+    const state = appState.channelDrag;
+    if (!state || event.pointerId !== state.pointerId) return;
+
+    const distance = Math.hypot(event.clientX - state.startX, event.clientY - state.startY);
+    if (!state.active && distance < 6) return;
+    event.preventDefault();
+
+    if (!state.active) activateChannelDrag(state);
+    updateChannelDragGhost(state, event.clientX, event.clientY);
+    reorderDraggedCardAtPoint(state, event.clientX, event.clientY);
+}
+
+function activateChannelDrag(state) {
+    state.active = true;
+    state.card.classList.add('is-dragging');
+    state.card.setAttribute('aria-grabbed', 'true');
+    state.container.classList.add('is-sorting');
+    document.body.classList.add('channel-drag-active');
+
+    const rect = state.card.getBoundingClientRect();
+    const ghost = state.card.cloneNode(true);
+    ghost.removeAttribute('id');
+    ghost.removeAttribute('aria-grabbed');
+    ghost.removeAttribute('data-channel-id');
+    ghost.classList.remove('is-dragging');
+    ghost.classList.add('channel-card-drag-ghost');
+    ghost.setAttribute('aria-hidden', 'true');
+    ghost.style.width = `${rect.width}px`;
+    ghost.style.height = `${rect.height}px`;
+    ghost.querySelectorAll('button, input').forEach(control => control.setAttribute('tabindex', '-1'));
+    document.body.appendChild(ghost);
+    state.ghost = ghost;
+}
+
+function updateChannelDragGhost(state, clientX, clientY) {
+    if (!state.ghost) return;
+    const left = Math.round(clientX - state.offsetX);
+    const top = Math.round(clientY - state.offsetY);
+    state.ghost.style.transform = `translate3d(${left}px, ${top}px, 0) rotate(0.35deg)`;
+}
+
+function reorderDraggedCardAtPoint(state, clientX, clientY) {
+    const containerRect = state.container.getBoundingClientRect();
+    const tolerance = 36;
+    if (clientX < containerRect.left - tolerance || clientX > containerRect.right + tolerance ||
+        clientY < containerRect.top - tolerance || clientY > containerRect.bottom + tolerance) {
+        return;
+    }
+
+    const candidates = getRenderedChannelCards(state.container).filter(card => card !== state.card);
+    if (candidates.length === 0) return;
+
+    const hit = document.elementFromPoint(clientX, clientY)?.closest('.channel-card');
+    let target = hit && hit.parentElement === state.container && hit !== state.card ? hit : null;
+    if (!target) {
+        target = candidates.reduce((nearest, candidate) => {
+            const rect = candidate.getBoundingClientRect();
+            const dx = Math.max(rect.left - clientX, 0, clientX - rect.right);
+            const dy = Math.max(rect.top - clientY, 0, clientY - rect.bottom);
+            const distance = (dx * dx) + (dy * dy);
+            return !nearest || distance < nearest.distance ? { card: candidate, distance } : nearest;
+        }, null)?.card || null;
+    }
+    if (!target) return;
+
+    const targetRect = target.getBoundingClientRect();
+    const multipleColumns = getChannelGridColumnCount(state.container) > 1;
+    const pointerWithinTargetRow = clientY >= targetRect.top && clientY <= targetRect.bottom;
+    const insertBefore = multipleColumns && pointerWithinTargetRow
+        ? clientX < targetRect.left + (targetRect.width / 2)
+        : clientY < targetRect.top + (targetRect.height / 2);
+
+    if (insertBefore) {
+        if (state.card.nextElementSibling !== target)
+            state.container.insertBefore(state.card, target);
+    } else if (target.nextElementSibling !== state.card) {
+        state.container.insertBefore(state.card, target.nextElementSibling);
+    }
+}
+
+function completeChannelDrag(event) {
+    finishChannelDrag(event, false);
+}
+
+function cancelChannelDrag(event) {
+    finishChannelDrag(event, true);
+}
+
+function cancelChannelDragWithEscape(event) {
+    if (event.key !== 'Escape' || !appState.channelDrag) return;
+    event.preventDefault();
+    finishChannelDrag(null, true);
+}
+
+function finishChannelDrag(event, cancelled) {
+    const state = appState.channelDrag;
+    if (!state || (event && event.pointerId !== undefined && event.pointerId !== state.pointerId)) return;
+
+    window.removeEventListener('pointermove', moveChannelDrag);
+    window.removeEventListener('pointerup', completeChannelDrag);
+    window.removeEventListener('pointercancel', cancelChannelDrag);
+    window.removeEventListener('keydown', cancelChannelDragWithEscape, true);
+    try {
+        if (state.handle.hasPointerCapture?.(state.pointerId))
+            state.handle.releasePointerCapture(state.pointerId);
+    } catch (_) { }
+
+    if (cancelled && state.active) restoreRenderedChannelOrder(state.container, state.initialOrder);
+    state.ghost?.remove();
+    state.card.classList.remove('is-dragging');
+    state.card.removeAttribute('aria-grabbed');
+    state.container.classList.remove('is-sorting');
+    document.body.classList.remove('channel-drag-active');
+    appState.channelDrag = null;
+
+    const finalOrder = getRenderedChannelOrder(state.container);
+    if (!state.active || cancelled || arraysEqual(finalOrder, state.initialOrder)) {
+        renderDashboard();
+        return;
+    }
+
+    persistChannelOrder(finalOrder, state.card.dataset.channelId, '频道顺序已保存');
+}
+
+function restoreRenderedChannelOrder(container, channelIds) {
+    const cardsById = new Map(getRenderedChannelCards(container).map(card => [card.dataset.channelId, card]));
+    channelIds.forEach(channelId => {
+        const card = cardsById.get(channelId);
+        if (card) container.appendChild(card);
+    });
+}
+
+function getChannelGridColumnCount(container) {
+    const cards = getRenderedChannelCards(container);
+    if (cards.length < 2) return cards.length;
+    const firstTop = cards[0].getBoundingClientRect().top;
+    const nextRowIndex = cards.findIndex((card, index) =>
+        index > 0 && Math.abs(card.getBoundingClientRect().top - firstTop) > 2);
+    return nextRowIndex === -1 ? cards.length : nextRowIndex;
+}
+
+function handleChannelOrderKeydown(event) {
+    const target = event.target instanceof Element ? event.target : null;
+    const handle = target?.closest('.channel-drag-handle');
+    if (!handle || handle.disabled || appState.channelOrderSaving || appState.channelDrag) return;
+
+    const supportedKeys = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'];
+    if (!supportedKeys.includes(event.key)) return;
+
+    const card = handle.closest('.channel-card');
+    const container = card?.parentElement;
+    const cards = getRenderedChannelCards(container);
+    const currentIndex = cards.indexOf(card);
+    if (!card || !container || currentIndex < 0 || cards.length < 2) return;
+
+    const columns = Math.max(1, getChannelGridColumnCount(container));
+    let targetIndex = currentIndex;
+    if (event.key === 'ArrowLeft') targetIndex = Math.max(0, currentIndex - 1);
+    if (event.key === 'ArrowRight') targetIndex = Math.min(cards.length - 1, currentIndex + 1);
+    if (event.key === 'ArrowUp') targetIndex = Math.max(0, currentIndex - columns);
+    if (event.key === 'ArrowDown') targetIndex = Math.min(cards.length - 1, currentIndex + columns);
+    if (event.key === 'Home') targetIndex = 0;
+    if (event.key === 'End') targetIndex = cards.length - 1;
+    if (targetIndex === currentIndex) return;
+
+    event.preventDefault();
+    const reference = cards[targetIndex];
+    if (targetIndex < currentIndex) container.insertBefore(card, reference);
+    else container.insertBefore(card, reference.nextElementSibling);
+
+    const position = targetIndex + 1;
+    persistChannelOrder(
+        getRenderedChannelOrder(container),
+        card.dataset.channelId,
+        `频道顺序已保存（第 ${position} 位）`);
+}
+
+async function persistChannelOrder(channelIds, focusChannelId = null, successMessage = '频道顺序已保存') {
+    if (appState.channelOrderSaving || channelIds.length < 2) return;
+
+    const container = document.getElementById('channels-container');
+    appState.channelOrderSaving = true;
+    container?.classList.add('channel-order-saving');
+    container?.setAttribute('aria-busy', 'true');
+    let savedOrder = null;
+
+    try {
+        const res = await apiFetch('/api/channels/reorder', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ channelIds })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || '频道顺序保存失败');
+
+        savedOrder = Array.isArray(data.channelIds) ? data.channelIds : channelIds;
+        applyChannelOrderToState(savedOrder);
+        showToast(successMessage, 'success');
+    } catch (err) {
+        showToast(err.message || '频道顺序保存失败', 'error');
+    } finally {
+        if (appState.authenticated) {
+            await Promise.all([loadConfig(), loadStatus()]);
+        }
+
+        appState.channelOrderSaving = false;
+        container?.classList.remove('channel-order-saving');
+        container?.removeAttribute('aria-busy');
+        if (appState.authenticated) renderDashboard();
+
+        if (focusChannelId) {
+            window.requestAnimationFrame(() => {
+                getRenderedChannelCards(container)
+                    .find(card => card.dataset.channelId === focusChannelId)
+                    ?.querySelector('.channel-drag-handle')
+                    ?.focus({ preventScroll: true });
+            });
+        }
+    }
+}
+
+function applyChannelOrderToState(channelIds) {
+    const reorder = channels => {
+        if (!Array.isArray(channels)) return channels;
+        const byId = new Map(channels.map(channel => [channel.id, channel]));
+        return channelIds.map(channelId => byId.get(channelId)).filter(Boolean);
+    };
+
+    if (appState.status) appState.status.channels = reorder(appState.status.channels);
+    if (appState.config) appState.config.channels = reorder(appState.config.channels);
+}
+
+function arraysEqual(left, right) {
+    return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function getPlatformDisplayName(platform) {
