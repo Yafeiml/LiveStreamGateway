@@ -1117,8 +1117,7 @@ app.MapGet("/huya-source/{channelId}/stream.m3u8", async (string channelId, Http
         HlsContinuityAssessment continuity = HlsPlaylistContinuity.Compare(cached?.Snapshot, currentSnapshot);
         string finalContent = RewriteHlsPlaylistUris(m3u8Content, playlistUri);
 
-        // 上游未标记时间线边界时，由本地代理在新窗口首段前补上。单纯 last+1 的正常前移
-        // 只建立解码边界，不立即重启；真空洞、序号回退等确认异常才升级为强自愈信号。
+        // 有跳段时补上解码边界并观察输出是否恢复；正常 last+1 前移无需标记，序号回退仍立即自愈。
         if (continuity.RequiresDiscontinuity && !currentSnapshot.HasLeadingDiscontinuity)
             finalContent = HlsPlaylistContinuity.InsertLeadingDiscontinuity(finalContent);
 
@@ -2188,7 +2187,7 @@ public static class HlsPlaylistContinuity
                     previousStart,
                     currentStart,
                     skipped,
-                    immediate: true,
+                    immediate: false,
                     $"media sequence skipped {skipped} segment(s) after previous window");
             }
 
@@ -2380,7 +2379,7 @@ public class ChannelMetrics
 
 public static class Globals
 {
-    public const string APP_VERSION = "v1.6.2";
+    public const string APP_VERSION = "v1.6.3";
     public const int HTTP_PORT = 9898;
     public const string HLS_DIR = "hls_stream";
     public const int HLS_MANIFEST_FRESH_SECONDS = 30;
@@ -2609,10 +2608,8 @@ public static class Globals
             metrics.ContinuityRecoveryInProgress = false;
             metrics.ContinuityRecoverySessionId = "";
             metrics.ContinuityRecoveryStartedAt = null;
-            metrics.ContinuityRecoveryPending = false;
-            metrics.ContinuityPendingSessionId = "";
-            metrics.ContinuityPendingUntil = null;
-            metrics.ContinuityDegraded = false;
+            // 本轮恢复启动后，新会话可能已收到另一项强异常；不能把新排队任务的健康告警一起抹掉。
+            metrics.ContinuityDegraded = metrics.ContinuityRecoveryPending;
             metrics.LastContinuityRecoveredAt = DateTime.UtcNow;
             return true;
         }
@@ -2799,7 +2796,8 @@ public class StreamManagerService : BackgroundService
     private readonly SemaphoreSlim _triggerSemaphore = new(0, 1);
     private DateTime _lastCookieCheckTime = DateTime.MinValue;
 
-    private sealed record PendingMediaRecovery(MediaFaultSignal Signal, DateTime RetryAtUtc);
+    private sealed record PendingMediaRecovery(
+        MediaFaultSignal Signal, DateTime RetryAtUtc, HlsOutputProgress? OutputBaseline);
 
     public StreamManagerService()
     {
@@ -3029,61 +3027,37 @@ public class StreamManagerService : BackgroundService
             recent.RemoveAll(item => item.OccurredAtUtc < cutoff);
             recent.Add(signal);
 
-            bool timestampWarmup = signal.Kind == MediaFaultKind.TimestampDiscontinuity &&
-                signal.OccurredAtUtc - currentSession.CreatedAtUtc < TimeSpan.FromSeconds(20);
-            bool hasIndependentContinuityEvidence = recent.Any(item =>
-                item.Kind is MediaFaultKind.SegmentSkip or MediaFaultKind.HuyaContinuity);
-            bool thresholdReached = signal.RequiresImmediateRecovery &&
-                (!timestampWarmup || hasIndependentContinuityEvidence);
-            if (signal.RequiresImmediateRecovery && timestampWarmup && !hasIndependentContinuityEvidence)
+            var strongEvidence = MediaRecoveryPolicy.SelectStrongEvidence(recent, currentSession.CreatedAtUtc);
+            if (strongEvidence == null)
             {
-                LogLifecycle(
-                    signal.ChannelId,
-                    "media-continuity-observed",
-                    $"category={signal.Category} sessionId={ShortSessionId(signal.SessionId)} pid={signal.ProcessId} " +
-                    $"detail={SafeLogValue(signal.Detail)} action=startup-warmup-observe");
-            }
-            if (!thresholdReached && signal.Kind == MediaFaultKind.NonMonotonicDts)
-            {
-                int nonMonotonicCount = recent.Count(item => item.Kind == MediaFaultKind.NonMonotonicDts);
-                bool hasIndependentBoundary = recent.Any(item =>
-                    item.Kind is MediaFaultKind.SegmentSkip or
-                        MediaFaultKind.HuyaContinuity or
-                        MediaFaultKind.TimestampDiscontinuity);
-                thresholdReached = nonMonotonicCount >= 10 ||
-                    (nonMonotonicCount >= 3 && hasIndependentBoundary);
-            }
-            if (!thresholdReached && signal.Kind == MediaFaultKind.SegmentSkip)
-            {
-                var skips = recent.Where(item => item.Kind == MediaFaultKind.SegmentSkip).ToArray();
-                thresholdReached = skips.Length >= 2 || skips.Sum(item => item.Weight) >= 4;
-            }
-            if (!thresholdReached && signal.Kind == MediaFaultKind.HuyaContinuity)
-            {
-                thresholdReached = recent.Count(item =>
-                    item.Kind == MediaFaultKind.HuyaContinuity &&
-                    !item.RequiresImmediateRecovery) >= 2;
-            }
-            if (!thresholdReached)
-            {
-                bool hasTimestampEvidence = recent.Any(item => item.Kind == MediaFaultKind.TimestampDiscontinuity);
-                bool hasSkipOrHuyaBoundary = recent.Any(item =>
-                    item.Kind is MediaFaultKind.SegmentSkip or MediaFaultKind.HuyaContinuity);
-                thresholdReached = hasTimestampEvidence && hasSkipOrHuyaBoundary;
+                // 保留最早的观察基线；后续轻微告警不能反复推迟截止时间，更不能覆盖排队的强异常。
+                if (!_pendingMediaRecoveries.TryGetValue(signal.ChannelId, out var existing) ||
+                    !string.Equals(existing.Signal.SessionId, signal.SessionId, StringComparison.Ordinal))
+                {
+                    var observedSignal = signal with { RequiresImmediateRecovery = false };
+                    _pendingMediaRecoveries[signal.ChannelId] = new PendingMediaRecovery(
+                        observedSignal,
+                        DateTime.UtcNow.AddSeconds(MediaRecoveryPolicy.ObservationSeconds),
+                        ReadOutputProgress(signal.ChannelId));
+                    LogLifecycle(signal.ChannelId, "media-continuity-observed",
+                        $"category={signal.Category} sessionId={ShortSessionId(signal.SessionId)} pid={signal.ProcessId} " +
+                        $"action=check-output-progress detail={SafeLogValue(signal.Detail)}");
+                }
+                continue;
             }
 
-            if (!thresholdReached || recoveryDecisions.ContainsKey(signal.ChannelId)) continue;
+            if (recoveryDecisions.ContainsKey(signal.ChannelId)) continue;
 
-            string detail = SafeLogValue(signal.Detail);
-            Globals.RecordContinuityAnomaly(signal.ChannelId, signal.Category, detail);
-            recoveryDecisions[signal.ChannelId] = signal;
+            string detail = SafeLogValue(strongEvidence.Detail);
+            Globals.RecordContinuityAnomaly(signal.ChannelId, strongEvidence.Category, detail);
+            recoveryDecisions[signal.ChannelId] = strongEvidence;
             LogLifecycle(
                 signal.ChannelId,
                 "media-continuity-anomaly",
-                $"category={signal.Category} sessionId={ShortSessionId(signal.SessionId)} pid={signal.ProcessId} detail={detail}");
+                $"category={strongEvidence.Category} sessionId={ShortSessionId(signal.SessionId)} pid={signal.ProcessId} detail={detail}");
         }
 
-        // 冷却/限流只延后恢复，不能丢弃一次性的强异常；到期后即使 FFmpeg 不再重复告警也会重试。
+        // 弱异常每轮复核真实分片增长；强异常仍保留冷却后的恢复，避免音频损坏被新清单掩盖。
         foreach (var pending in _pendingMediaRecoveries.ToArray())
         {
             MediaFaultSignal signal = pending.Value.Signal;
@@ -3109,7 +3083,25 @@ public class StreamManagerService : BackgroundService
                 Globals.ClearContinuityRecoveryPending(signal.ChannelId, signal.SessionId);
                 continue;
             }
+            if (recoveryDecisions.ContainsKey(signal.ChannelId)) continue;
+            if (MediaRecoveryPolicy.CanCancelObservation(
+                signal, pending.Value.OutputBaseline, ReadOutputProgress(signal.ChannelId), DateTime.UtcNow))
+            {
+                _pendingMediaRecoveries.TryRemove(pending.Key, out _);
+                Globals.CancelContinuityRecovery(signal.ChannelId, clearDegraded: true);
+                LogLifecycle(signal.ChannelId, "media-continuity-observation-cleared",
+                    $"category={signal.Category} sessionId={ShortSessionId(signal.SessionId)} pid={signal.ProcessId} " +
+                    "reason=output-progressing");
+                continue;
+            }
             if (pending.Value.RetryAtUtc > DateTime.UtcNow) continue;
+            if (!signal.RequiresImmediateRecovery)
+            {
+                Globals.RecordContinuityAnomaly(signal.ChannelId, signal.Category, signal.Detail);
+                LogLifecycle(signal.ChannelId, "media-continuity-anomaly",
+                    $"category={signal.Category} sessionId={ShortSessionId(signal.SessionId)} pid={signal.ProcessId} " +
+                    "reason=output-not-recovered");
+            }
             recoveryDecisions.TryAdd(signal.ChannelId, signal);
         }
 
@@ -3156,9 +3148,15 @@ public class StreamManagerService : BackgroundService
         if (suppressionReason != null)
         {
             DateTime retryAtUtc = DateTime.UtcNow.AddSeconds(retryAfterSeconds);
+            _pendingMediaRecoveries.TryGetValue(channel.Id, out var existing);
+            bool sameSession = existing != null && existing.Signal.SessionId == signal.SessionId;
+            // 优先保留已确认的时间线损坏，后续网络抖动不能把它降级为可取消的观察任务。
+            MediaFaultSignal retainedSignal = sameSession && existing!.Signal.RequiresImmediateRecovery
+                ? existing.Signal : signal;
             _pendingMediaRecoveries[channel.Id] = new PendingMediaRecovery(
-                signal,
-                retryAtUtc);
+                retainedSignal,
+                retryAtUtc,
+                sameSession ? existing!.OutputBaseline : ReadOutputProgress(channel.Id));
             Globals.MarkContinuityRecoveryPending(channel.Id, signal.SessionId, retryAtUtc);
             LogLifecycle(
                 channel.Id,
@@ -3213,6 +3211,9 @@ public class StreamManagerService : BackgroundService
             startLock.Release();
         }
     }
+
+    private static HlsOutputProgress? ReadOutputProgress(string channelId) =>
+        HlsOutputProgress.Read(Path.Combine(Globals.HLS_FULL_PATH, channelId, "stream.m3u8"));
 
     private static async Task ResetSourceStateAsync(ChannelConfig channel, CancellationToken cancellationToken)
     {
@@ -3905,6 +3906,7 @@ public class StreamManagerService : BackgroundService
             "-rw_timeout", "15000000",
             "-headers", $"Referer: {referer}\r\n",
             "-user_agent", userAgent,
+            .. FfmpegInputOptions.ForPlatform(platform),
             "-i", sourceStreamUrl,
             "-c:v", "copy", "-c:a", "copy", "-sn",
             "-f", "hls", "-hls_time", "3", "-hls_list_size", "15",
