@@ -4,7 +4,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: yafeiml/livestreamgateway:latest
+    image: ghcr.io/yafeiml/livestreamgateway:latest
     container_name: live-stream-gateway
     restart: unless-stopped
     ports:

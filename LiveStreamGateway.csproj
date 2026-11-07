@@ -3,16 +3,26 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
+    <EnableWindowsTray Condition="'$(EnableWindowsTray)' == ''">false</EnableWindowsTray>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <ServerGarbageCollection>true</ServerGarbageCollection>
-    <Version>1.6.3</Version>
-    <AssemblyVersion>1.6.3</AssemblyVersion>
-    <FileVersion>1.6.3</FileVersion>
+    <Version>1.7.0</Version>
+    <AssemblyVersion>1.7.0</AssemblyVersion>
+    <FileVersion>1.7.0</FileVersion>
+    <ApplicationIcon>assets\LiveStreamGateway.ico</ApplicationIcon>
     <DefaultItemExcludes>$(DefaultItemExcludes);dist\**;tests\**</DefaultItemExcludes>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(EnableWindowsTray)' == 'true'">
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <OutputType>WinExe</OutputType>
+    <DefineConstants>$(DefineConstants);WINDOWS_TRAY</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup>
+    <EmbeddedResource Include="assets\LiveStreamGateway.ico" LogicalName="LiveStreamGateway.AppIcon.ico" />
     <Content Update="config.example.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>

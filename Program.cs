@@ -19,7 +19,15 @@ using LiveStreamGateway;
 // -------------------------------------------------------------
 // Top-Level Application Setup
 // -------------------------------------------------------------
+#if WINDOWS_TRAY
+using var windowsTray = WindowsTrayHost.Start($"http://127.0.0.1:{Globals.HTTP_PORT}/");
+if (windowsTray is null) return;
+try
+{
+bool interactiveConsole = false;
+#else
 bool interactiveConsole = !Console.IsInputRedirected && !Console.IsOutputRedirected;
+#endif
 try {
     Console.Title = "LiveStreamGateway - .NET 10";
     if (interactiveConsole) Console.CursorVisible = false;
@@ -29,13 +37,23 @@ try {
 if (!await LoadConfigAsync())
 {
     ShowError($"无法加载 {Globals.CONFIG_FILE_NAME}，请检查文件。");
+    Environment.ExitCode = 1;
     return;
 }
 
 Globals.LocalIp = GetLocalIPAddress();
 
 // Configure WebApplication
+#if WINDOWS_TRAY
+var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+{
+    Args = args,
+    ContentRootPath = AppContext.BaseDirectory,
+    WebRootPath = Path.Combine(AppContext.BaseDirectory, "wwwroot")
+});
+#else
 var builder = WebApplication.CreateBuilder(args);
+#endif
 
 // 容器环境中保留应用生命周期和故障日志，但关闭逐请求 Information 噪声。
 builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
@@ -47,7 +65,9 @@ builder.WebHost.ConfigureKestrel(options =>
 });
 
 // Add Hosted Services for HealthCheck and UI Render
+#if !WINDOWS_TRAY
 builder.Services.AddHostedService<RenderService>();
+#endif
 builder.Services.AddHostedService<StreamManagerService>();
 builder.Services.AddSingleton<AdminAuthService>();
 builder.Services.AddSingleton<PlaybackTokenRateLimiter>();
@@ -1400,7 +1420,11 @@ if (interactiveConsole)
 
 try
 {
+#if WINDOWS_TRAY
+    await app.RunAsync(windowsTray.ShutdownToken);
+#else
     await app.RunAsync();
+#endif
 }
 finally
 {
@@ -1411,6 +1435,18 @@ finally
     }
     Console.WriteLine("服务器已停止。");
 }
+#if WINDOWS_TRAY
+}
+catch (OperationCanceledException) when (windowsTray.ShutdownToken.IsCancellationRequested)
+{
+    // 启动期间点击退出也使用相同的宿主清理路径。
+}
+catch (Exception ex)
+{
+    Environment.ExitCode = 1;
+    WindowsTrayHost.ShowError($"服务无法运行：\n{ex.Message}");
+}
+#endif
 
 // -------------------------------------------------------------
 // Helper Methods (Local Functions for Top-Level Statements)
@@ -1921,6 +1957,9 @@ static IResult HuyaProxyFailure(string channelId, string reason)
 
 static void ShowError(string message)
 {
+#if WINDOWS_TRAY
+    WindowsTrayHost.ShowError(message);
+#else
     Console.ForegroundColor = ConsoleColor.Red;
     Console.WriteLine($"\n{message}");
     Console.ResetColor();
@@ -1929,6 +1968,7 @@ static void ShowError(string message)
         Console.WriteLine("按任意键退出...");
         Console.ReadKey();
     }
+#endif
 }
 
 // -------------------------------------------------------------
@@ -2379,7 +2419,7 @@ public class ChannelMetrics
 
 public static class Globals
 {
-    public const string APP_VERSION = "v1.6.3";
+    public const string APP_VERSION = "v1.7.0";
     public const int HTTP_PORT = 9898;
     public const string HLS_DIR = "hls_stream";
     public const int HLS_MANIFEST_FRESH_SECONDS = 30;
@@ -2766,7 +2806,7 @@ public class RenderService : BackgroundService
     }
 }
 
-public class StreamManagerService : BackgroundService
+public class StreamManagerService : BackgroundService, IAsyncDisposable
 {
     private const int HEALTH_CHECK_SECONDS = 10;
     private const int STALE_THRESHOLD_SECONDS = 30;
@@ -2779,6 +2819,10 @@ public class StreamManagerService : BackgroundService
 
     // 每个频道对应一个 StreamingSession（包含 Process + 日志资源，可靠释放）
     private readonly ConcurrentDictionary<string, StreamingSession> _sessions = new();
+    private readonly object _sessionLifecycleLock = new();
+    private readonly HashSet<Task> _pendingSessionDisposals = [];
+    private bool _stopping;
+    private Task? _shutdownTask;
 
     // 【OnDemand 防启动风暴】每个频道一把启动锁，保证并发首次请求只创建一个 FFmpeg
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _startupLocks = new();
@@ -2802,6 +2846,29 @@ public class StreamManagerService : BackgroundService
     public StreamManagerService()
     {
         Globals.StreamManager = this;
+    }
+
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        // 先封住新会话并清理进程，避免上游解析迟迟不返回时留下 FFmpeg。
+        Task cleanup = StopAllSessionsAsync();
+        try { await base.StopAsync(cancellationToken).ConfigureAwait(false); }
+        finally { await cleanup.ConfigureAwait(false); }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        // RunAsync 启动失败时也会释放 DI 宿主，但不一定调用 StopAsync。
+        base.Dispose();
+        await StopAllSessionsAsync().ConfigureAwait(false);
+        GC.SuppressFinalize(this);
+    }
+
+    public override void Dispose()
+    {
+        base.Dispose();
+        StopAllSessionsAsync().GetAwaiter().GetResult();
+        GC.SuppressFinalize(this);
     }
 
     internal static bool IsOfflineResult(string? error) =>
@@ -2903,9 +2970,22 @@ public class StreamManagerService : BackgroundService
     /// <summary>停止并释放单个频道的 FFmpeg 会话（线程安全，正确释放所有资源）</summary>
     public async Task StopSessionAsync(string channelId)
     {
-        if (_sessions.TryRemove(channelId, out var session))
+        Task? disposal = null;
+        lock (_sessionLifecycleLock)
         {
-            await session.DisposeAsync();
+            if (_sessions.TryRemove(channelId, out var session))
+            {
+                disposal = session.DisposeAsync().AsTask();
+                _pendingSessionDisposals.Add(disposal);
+            }
+        }
+        if (disposal != null)
+        {
+            try { await disposal.ConfigureAwait(false); }
+            finally
+            {
+                lock (_sessionLifecycleLock) _pendingSessionDisposals.Remove(disposal);
+            }
         }
 
         // 会话停止后立即撤下旧清单；否则 OnDemand 的下一位客户端会播放停流前的时间轴。
@@ -3261,6 +3341,19 @@ public class StreamManagerService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        try
+        {
+            await RunStreamManagerAsync(stoppingToken);
+        }
+        finally
+        {
+            // 预热或巡检中取消/异常也必须释放 FFmpeg，不能只依赖循环正常结束。
+            await StopAllSessionsAsync();
+        }
+    }
+
+    private async Task RunStreamManagerAsync(CancellationToken stoppingToken)
+    {
         if (string.IsNullOrEmpty(FFMPEG_EXE_PATH) || !File.Exists(FFMPEG_EXE_PATH))
         {
             string err = "错误：未找到 FFmpeg！请将 ffmpeg.exe 放入程序同目录，或安装 FFmpeg 并加入系统 PATH 环境变量。";
@@ -3584,8 +3677,6 @@ public class StreamManagerService : BackgroundService
             catch { }
         }
 
-        // 关闭时释放所有会话
-        await StopAllSessionsAsync();
     }
 
     /// <summary>
@@ -3820,24 +3911,29 @@ public class StreamManagerService : BackgroundService
         if (channel.Platform?.ToLower() == "huya")
             inputUrl = $"http://127.0.0.1:{Globals.HTTP_PORT}/huya-source/{channel.Id}/stream.m3u8";
 
-        var newSession = CreateSession(channel.Id, inputUrl, channelHlsDir, channel.Platform ?? "");
-        if (newSession != null)
+        lock (_sessionLifecycleLock)
         {
-            _sessions[channel.Id] = newSession;
-            Globals.BindContinuityRecoverySession(channel.Id, newSession.SessionId);
-            Globals.UpdateState(channel.Id, ChannelState.Starting);
-            Globals.UpdateStatus(channel.Id, "已启动推流", ConsoleColor.Green);
-            var metrics = Globals.Metrics.GetOrAdd(channel.Id, _ => new ChannelMetrics());
-            lock (metrics) metrics.StartCount++;
-            LogLifecycle(channel.Id, "started", $"pid={newSession.Process.Id}");
-        }
-        else
-        {
-            Globals.CancelContinuityRecovery(channel.Id, clearDegraded: false);
-            Globals.RecordError(channel.Id);
-            LogLifecycle(channel.Id, "start-failed", "reason=ffmpeg-process");
-            Globals.UpdateStatus(channel.Id, "FFmpeg 进程启动失败", ConsoleColor.Red);
-            Globals.UpdateState(channel.Id, ChannelState.Error);
+            // 源解析期间可能已点击退出。创建和发布会话必须与关闭封口互斥。
+            if (_stopping || ct.IsCancellationRequested) return;
+            var newSession = CreateSession(channel.Id, inputUrl, channelHlsDir, channel.Platform ?? "");
+            if (newSession != null)
+            {
+                _sessions[channel.Id] = newSession;
+                Globals.BindContinuityRecoverySession(channel.Id, newSession.SessionId);
+                Globals.UpdateState(channel.Id, ChannelState.Starting);
+                Globals.UpdateStatus(channel.Id, "已启动推流", ConsoleColor.Green);
+                var metrics = Globals.Metrics.GetOrAdd(channel.Id, _ => new ChannelMetrics());
+                lock (metrics) metrics.StartCount++;
+                LogLifecycle(channel.Id, "started", $"pid={newSession.Process.Id}");
+            }
+            else
+            {
+                Globals.CancelContinuityRecovery(channel.Id, clearDegraded: false);
+                Globals.RecordError(channel.Id);
+                LogLifecycle(channel.Id, "start-failed", "reason=ffmpeg-process");
+                Globals.UpdateStatus(channel.Id, "FFmpeg 进程启动失败", ConsoleColor.Red);
+                Globals.UpdateState(channel.Id, ChannelState.Error);
+            }
         }
     }
 
@@ -3970,11 +4066,25 @@ public class StreamManagerService : BackgroundService
         }
     }
 
-    private async Task StopAllSessionsAsync()
+    private Task StopAllSessionsAsync()
+    {
+        lock (_sessionLifecycleLock)
+        {
+            _stopping = true;
+            // StopAsync 与 ExecuteAsync.finally 等待同一次完整清理。
+            return _shutdownTask ??= StopSessionsCoreAsync();
+        }
+    }
+
+    private async Task StopSessionsCoreAsync()
     {
         var ids = _sessions.Keys.ToArray();
         foreach (var id in ids)
-            await StopSessionAsync(id);
+            await StopSessionAsync(id).ConfigureAwait(false);
+        // 另一个请求可能已将会话移出字典，但日志/进程资源尚在释放。
+        Task[] pending;
+        lock (_sessionLifecycleLock) pending = _pendingSessionDisposals.ToArray();
+        await Task.WhenAll(pending).ConfigureAwait(false);
     }
 }
 
@@ -4564,18 +4674,18 @@ public sealed class StreamingSession : IAsyncDisposable
             if (!Process.HasExited)
             {
                 Process.Kill(entireProcessTree: true);
-                await Process.WaitForExitAsync();
+                await Process.WaitForExitAsync().ConfigureAwait(false);
             }
         }
         catch { }
 
         // 3. 等待两个日志任务真正完成（确保 StreamWriter 不再被写入）
-        try { await Task.WhenAll(_stderrTask, _stdoutTask); } catch { }
+        try { await Task.WhenAll(_stderrTask, _stdoutTask).ConfigureAwait(false); } catch { }
 
         // 4. 释放所有资源
         try { _cts.Dispose(); } catch { }
         try { _logSemaphore.Dispose(); } catch { }
-        try { await _logWriter.DisposeAsync(); } catch { }
+        try { await _logWriter.DisposeAsync().ConfigureAwait(false); } catch { }
         try { Process.Dispose(); } catch { }
     }
 }

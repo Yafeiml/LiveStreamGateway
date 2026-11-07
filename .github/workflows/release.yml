@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release Tag Name (e.g. v1.1.0)'
+        description: 'Release Tag Name (e.g. v1.7.0)'
         required: true
-        default: 'v1.1.0'
+        default: 'v1.7.0'
 
 permissions:
   contents: write
@@ -38,6 +38,14 @@ jobs:
           else
             echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
+
+      - name: Run Regression Tests
+        shell: pwsh
+        run: |
+          dotnet test --solution LiveStreamGateway.sln -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet test --project tests/LiveStreamGateway.Windows.Tests/LiveStreamGateway.Windows.Tests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Extract Current Version Release Notes
         id: release_notes
@@ -110,11 +118,12 @@ jobs:
           
           echo "FFMPEG_PATH=$($ffmpegExe.FullName)" >> $env:GITHUB_ENV
 
-      - name: Publish Single-File Executable
+      - name: Publish Windows Tray Executable
         shell: pwsh
         run: |
           dotnet publish LiveStreamGateway.csproj -c Release -r win-x64 `
             --self-contained true `
+            -p:EnableWindowsTray=true `
             -p:PublishSingleFile=true `
             -p:IncludeNativeLibrariesForSelfExtract=true `
             -p:DebugType=None `
@@ -128,7 +137,9 @@ jobs:
           
           # Copy docs & config
           Copy-Item config.example.json -Destination ./out/config.example.json -Force
-          Copy-Item config.example.json -Destination ./out/config.json -Force
+          if (Test-Path ./out/config.json) {
+            throw "Release output must not contain config.json; only config.example.json may be packaged."
+          }
           Copy-Item README.md -Destination ./out/README.md -Force
           Copy-Item LICENSE -Destination ./out/LICENSE -Force
           
@@ -185,7 +196,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}}
+            type=semver,pattern={{version}},value=${{ github.event.inputs.tag_name || github.ref_name }}
             type=raw,value=latest
 
       - name: Build and Push Multi-Arch Docker Image
@@ -194,5 +205,7 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          pull: true
+          no-cache: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

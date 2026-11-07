@@ -1,0 +1,22 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageVersion Include="xunit.v3" Version="4.0.2" />
+    <PackageVersion Include="coverlet.MTP" Version="10.1.0" />
+    <!-- Keep the testing platform and its extensions on the same servicing release. -->
+    <PackageVersion Include="Microsoft.Testing.Platform" Version="2.5.2" />
+    <PackageVersion Include="Microsoft.Testing.Platform.MSBuild" Version="2.5.2" />
+    <PackageVersion Include="Microsoft.Testing.Extensions.Telemetry" Version="2.5.2" />
+    <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport.Abstractions" Version="2.5.2" />
+    <!-- Coverlet's configuration dependencies share the .NET 10 servicing version. -->
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Json" Version="10.0.14" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.14" />
+    <PackageVersion Include="Microsoft.Bcl.AsyncInterfaces" Version="10.0.14" />
+    <!-- Do not override ApplicationInsights to 3.x: MTP telemetry still calls the
+         three-argument TrackEvent overload removed in that major version. -->
+  </ItemGroup>
+</Project>

@@ -28,7 +28,8 @@ public class DouyuExtractorTests
 
         string roomId = await DouyuRoomResolver.ResolveCanonicalRoomIdAsync(
             client,
-            "https://www.douyu.com/6657");
+            "https://www.douyu.com/6657",
+            TestContext.Current.CancellationToken);
 
         Assert.Equal("6979222", roomId);
         Assert.Equal("https://m.douyu.com/6657", requestedUri?.AbsoluteUri);
@@ -42,7 +43,8 @@ public class DouyuExtractorTests
 
         string roomId = await DouyuRoomResolver.ResolveCanonicalRoomIdAsync(
             client,
-            "https://www.douyu.com/6979222");
+            "https://www.douyu.com/6979222",
+            TestContext.Current.CancellationToken);
 
         Assert.Equal("6979222", roomId);
     }

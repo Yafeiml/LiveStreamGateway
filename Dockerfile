@@ -8,7 +8,7 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
 # Copy project file and restore dependencies
-COPY ["LiveStreamGateway.csproj", "./"]
+COPY ["LiveStreamGateway.csproj", "global.json", "./"]
 RUN dotnet restore "LiveStreamGateway.csproj"
 
 # Copy source code and wwwroot

@@ -169,10 +169,11 @@
 
 ### Windows 原生 EXE / 源码运行首次设置
 
-启动 `LiveStreamGateway.exe` 或 `dotnet run` 后，打开 `http://localhost:9898`，或从其它设备访问 `http://<运行主机IP>:9898`。面板会自动显示创建密码引导，输入并确认新密码即可进入控制台，不需要额外初始化码。
+启动 `LiveStreamGateway.exe` 后，程序会在 Windows 系统托盘中运行，不再显示滚动日志黑窗。通过托盘菜单打开 Web 控制台，或访问 `http://localhost:9898`（其它设备使用 `http://<运行主机IP>:9898`）。面板会自动显示创建密码引导，输入并确认新密码即可进入控制台，不需要额外初始化码。源码运行 `dotnet run` 时的首次设置方式相同。
 
 ### 从旧版本升级
 
+- Windows 用户先退出旧进程，再解压新版并启动；保留原有 `config.json`。从 v1.7.0 起，Windows 发布包仅提供 `config.example.json`，不会预置 `config.json`；首次部署会自动创建实际配置，覆盖升级不会因包内默认配置误清空原配置。
 - `AdminPasswordHash` 不存在或为空时，升级后第一次访问自动进入创建密码引导；原有频道、Cookie、推流模式等配置不会被清空；
 - 已经设置过管理员密码的实例仍显示普通登录界面，不会重新触发初始化流程；
 - 首次设置会自动生成新的 6 位数字播放令牌。已经配置的旧长令牌升级后继续有效，只有主动轮换时才会替换为 6 位数字；
@@ -317,11 +318,51 @@ docker run -d \
    - **方式 3（Windows 终端一行命令安装）**：在终端运行 `winget install Gyan.FFmpeg` 即可全自动安装。
 
 ### 步骤 2：启动服务
-在项目目录下执行：
+
+Windows 独立版解压后直接双击 `LiveStreamGateway.exe`，程序常驻系统托盘，不显示控制台黑窗。托盘仅提供以下操作：
+
+- **打开 Web 控制台**：使用默认浏览器打开本机管理页面（默认 `http://127.0.0.1:9898/`）；
+- **开机自启**：勾选后，在当前用户下次登录 Windows 时自动启动网关；取消勾选即可关闭，不需要管理员权限；
+- **退出**：停止网关及其 FFmpeg 推流进程，并退出托盘。
+
+自启启动的是完整网关服务，沿用已有推流配置：`AlwaysOn` 模式自动拉起启用频道，`OnDemand` 模式仍保持按需推流（包括已配置的预热频道）。这里的“开机自启”指用户登录后启动，不是登录前运行的 Windows 服务。Releases 独立版自带所需的 .NET 运行时和 FFmpeg，无需额外安装托盘组件。
+
+源码默认保持跨平台控制台模式，在项目目录下执行：
+
 ```bash
 dotnet run
 ```
-或直接双击运行下载的 `LiveStreamGateway.exe`。
+
+在 Windows 上调试托盘模式，或自行发布 Windows 独立版时，显式启用 `EnableWindowsTray`：
+
+```powershell
+# 源码运行 Windows 托盘模式
+dotnet run -p:EnableWindowsTray=true
+
+# 发布 Windows x64 独立版（FFmpeg 需另外准备，或使用 Releases 完整包）
+dotnet publish LiveStreamGateway.csproj -c Release -r win-x64 --self-contained true -p:EnableWindowsTray=true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o ./publish-win-x64
+```
+
+托盘模式使用 C#/.NET 自带的 WinForms `NotifyIcon`。只有显式启用时才使用 Windows 目标框架；默认 `net10.0` 构建、测试及 Linux/Docker 部署不变。
+
+#### 源码依赖与回归测试
+
+源码构建与测试需要 .NET 10 SDK；仅运行自包含 Releases 版本不需要安装 SDK。测试依赖版本统一维护在 `tests/Directory.Packages.props`，使用 xUnit v3 和 Microsoft.Testing.Platform，`global.json` 仅指定测试运行平台，不锁定 SDK 补丁版本。
+
+测试平台传递依赖的 ApplicationInsights 暂时保留 2.x：其当前使用的 `TrackEvent` 重载已在 3.x 中移除，需等待上游完成适配，不能单独强制升级。
+
+```powershell
+# 跨平台回归测试
+dotnet test --solution LiveStreamGateway.sln -c Release
+
+# Windows 专用回归测试（仅在 Windows 上运行）
+dotnet test --project tests/LiveStreamGateway.Windows.Tests/LiveStreamGateway.Windows.Tests.csproj -c Release
+
+# 使用 Coverlet 收集跨平台测试覆盖率
+dotnet test --project tests/LiveStreamGateway.Tests/LiveStreamGateway.Tests.csproj -c Release --coverlet
+```
+
+前端 hls.js 固定为已验证的稳定版本；GitHub Actions 和 .NET 10 Docker 基础镜像沿用稳定主版本通道。Windows 发布包在构建时下载 FFmpeg 最新稳定版，Docker 内的 FFmpeg 则使用基础发行版维护的 apt 软件包。
 
 ### 步骤 3：设置管理员密码并登录
 

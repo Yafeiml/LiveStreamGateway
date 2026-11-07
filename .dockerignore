@@ -6,6 +6,10 @@
 **/hls_stream
 **/*.user
 **/*.log
+**/config.json
+**/config.json.*
+**/config*.bak
+**/config*.backup*
 ffmpeg.exe
 ffmpeg
 ffprobe.exe
