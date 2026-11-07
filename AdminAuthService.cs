@@ -10,7 +10,7 @@ using Microsoft.AspNetCore.Http;
 /// 管理端密码与内存会话服务。
 /// 密码只以 PBKDF2 哈希写入 config.json；会话令牌只通过 HttpOnly Cookie 传递。
 /// </summary>
-public sealed class AdminAuthService
+public sealed class AdminAuthService : IDisposable
 {
     public const string SessionCookieName = "lsg_admin_session";
     public static readonly TimeSpan SessionLifetime = TimeSpan.FromHours(12);
@@ -146,6 +146,7 @@ public sealed class AdminAuthService
         CleanupExpiredSessions();
         string token = Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
         string playbackToken = "";
+        PlaybackTokenEncryptionKey? protection = null;
         if (!string.IsNullOrEmpty(adminPassword))
         {
             string encryptedPlaybackToken;
@@ -159,9 +160,36 @@ public sealed class AdminAuthService
             if (PlaybackTokenProtector.TryUnprotect(encryptedPlaybackToken, adminPassword, out string recovered) &&
                 PlaybackTokenProtector.ValidateToken(recovered, playbackTokenHash))
                 playbackToken = recovered;
+            protection = PlaybackTokenProtector.CreateSessionProtection(adminPassword, encryptedPlaybackToken);
         }
 
-        _sessions[GetSessionKey(token)] = new AdminSession(DateTime.UtcNow.Add(SessionLifetime), playbackToken);
+        _sessions[GetSessionKey(token)] = new AdminSession(DateTime.UtcNow.Add(SessionLifetime), playbackToken, protection);
+        return token;
+    }
+
+    internal bool TryGetPlaybackTokenProtection(HttpRequest request, out PlaybackTokenEncryptionKey? protection)
+    {
+        protection = null;
+        if (!request.Cookies.TryGetValue(SessionCookieName, out string? token) || string.IsNullOrWhiteSpace(token))
+            return false;
+        string key = GetSessionKey(token);
+        if (!_sessions.TryGetValue(key, out AdminSession? session))
+            return false;
+        if (session.ExpiresAtUtc <= DateTime.UtcNow)
+        {
+            RemoveSession(key);
+            return false;
+        }
+        return session.Protection?.TryClone(out protection) == true;
+    }
+
+    internal string CreateSession(PlaybackTokenEncryptionKey protection, string playbackToken)
+    {
+        if (!protection.TryClone(out PlaybackTokenEncryptionKey? copy))
+            throw new ObjectDisposedException(nameof(protection));
+        CleanupExpiredSessions();
+        string token = Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
+        _sessions[GetSessionKey(token)] = new AdminSession(DateTime.UtcNow.Add(SessionLifetime), playbackToken, copy);
         return token;
     }
 
@@ -175,7 +203,7 @@ public sealed class AdminAuthService
             return false;
         if (session.ExpiresAtUtc <= DateTime.UtcNow)
         {
-            _sessions.TryRemove(key, out _);
+            RemoveSession(key);
             return false;
         }
 
@@ -199,10 +227,22 @@ public sealed class AdminAuthService
     public void RevokeSession(HttpRequest request)
     {
         if (request.Cookies.TryGetValue(SessionCookieName, out string? token) && !string.IsNullOrWhiteSpace(token))
-            _sessions.TryRemove(GetSessionKey(token), out _);
+            RemoveSession(GetSessionKey(token));
     }
 
-    public void InvalidateAllSessions() => _sessions.Clear();
+    public void InvalidateAllSessions()
+    {
+        foreach (string key in _sessions.Keys)
+            RemoveSession(key);
+    }
+
+    public void Dispose() => InvalidateAllSessions();
+
+    private void RemoveSession(string key)
+    {
+        if (_sessions.TryRemove(key, out AdminSession? session))
+            session.Protection?.Dispose();
+    }
 
     public static void AppendSessionCookie(HttpResponse response, string token, bool isHttps)
     {
@@ -244,7 +284,7 @@ public sealed class AdminAuthService
         foreach (var item in _sessions)
         {
             if (item.Value.ExpiresAtUtc <= now)
-                _sessions.TryRemove(item.Key, out _);
+                RemoveSession(item.Key);
         }
     }
 
@@ -261,7 +301,7 @@ public sealed class AdminAuthService
         public DateTime BlockedUntilUtc { get; set; } = DateTime.MinValue;
     }
 
-    private sealed record AdminSession(DateTime ExpiresAtUtc, string PlaybackToken);
+    private sealed record AdminSession(DateTime ExpiresAtUtc, string PlaybackToken, PlaybackTokenEncryptionKey? Protection);
 }
 
 public sealed class AuthLoginRequest
@@ -280,12 +320,37 @@ public sealed class AuthPasswordChangeRequest
     public string NewPassword { get; set; } = "";
 }
 
-public sealed class PlaybackTokenRotateRequest
-{
-    public string CurrentPassword { get; set; } = "";
-}
-
 public sealed class PlaybackTokenAuthRequest
 {
     public bool Enabled { get; set; } = true;
+}
+
+/// <summary>必须在会话鉴权之前调用，让等候中的旧会话在密钥变更后重新接受鉴权。</summary>
+internal sealed class AdminAuthMutationGate : IDisposable
+{
+    private readonly SemaphoreSlim _gate = new(1, 1);
+
+    internal async Task InvokeAsync(HttpContext context, RequestDelegate next)
+    {
+        bool requiresGate = HttpMethods.IsPost(context.Request.Method) &&
+            (context.Request.Path.StartsWithSegments("/api/auth", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(context.Request.Path.Value?.TrimEnd('/'), "/api/playback-token/rotate", StringComparison.OrdinalIgnoreCase));
+        if (!requiresGate)
+        {
+            await next(context);
+            return;
+        }
+
+        await _gate.WaitAsync(context.RequestAborted);
+        try
+        {
+            await next(context);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public void Dispose() => _gate.Dispose();
 }

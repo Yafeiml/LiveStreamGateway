@@ -445,9 +445,7 @@ async function changeAdminPassword(event) {
 function openPlaybackSecurityModal() {
     renderPlaybackSecurityState();
     const error = document.getElementById('playback-token-error');
-    const password = document.getElementById('playback-token-current-password');
     if (error) error.innerText = '';
-    if (password) password.value = '';
     openModal('modal-playback-security');
 }
 
@@ -526,7 +524,6 @@ async function updatePlaybackTokenAuthentication(event) {
 
 async function rotatePlaybackToken(event) {
     event.preventDefault();
-    const currentPassword = document.getElementById('playback-token-current-password')?.value || '';
     const error = document.getElementById('playback-token-error');
     const button = document.getElementById('btn-rotate-playback-token');
     if (error) error.innerText = '';
@@ -550,9 +547,7 @@ async function rotatePlaybackToken(event) {
 
     try {
         const res = await apiFetch('/api/playback-token/rotate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ currentPassword })
+            method: 'POST'
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
@@ -560,8 +555,6 @@ async function rotatePlaybackToken(event) {
             return;
         }
 
-        if (document.getElementById('playback-token-current-password'))
-            document.getElementById('playback-token-current-password').value = '';
         await loadStatus(false);
         renderPlaybackSecurityState();
         showToast(authEnabled ? '6 位数字令牌已轮换，请更新客户端地址' : '6 位数字令牌已轮换', 'success');

@@ -5,6 +5,7 @@
 - `LiveStreamGateway.png`：图像生成工具内置模式生成的原始设计。
 - `LiveStreamGateway.ico`：同一设计的 Windows 多尺寸图标，包含 16、20、24、32、40、48、64、128、256 px，均保留透明度。
 - EXE 使用 `ApplicationIcon`；托盘加载 `LiveStreamGateway.AppIcon.ico` 内嵌资源，无需单独分发图标文件。
+- Web 标签页直接使用同一 ICO；登录页及面板页眉使用其中原有的 256 px PNG 帧，Windows 与 Docker 均无需额外分发图标文件。
 
 在 Windows PowerShell / PowerShell 中重新打包图标（不需要额外依赖）：
 

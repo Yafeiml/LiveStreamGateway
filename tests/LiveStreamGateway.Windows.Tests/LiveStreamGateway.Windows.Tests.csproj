@@ -18,6 +18,7 @@
   <ItemGroup>
     <Compile Include="..\..\WindowsStartupRegistration.cs" Link="WindowsStartupRegistration.cs" />
     <Compile Include="..\..\WindowsAppIcon.cs" Link="WindowsAppIcon.cs" />
+    <Compile Include="..\..\AppIconAssets.cs" Link="AppIconAssets.cs" />
     <EmbeddedResource Include="..\..\assets\LiveStreamGateway.ico" LogicalName="LiveStreamGateway.AppIcon.ico" />
     <Using Include="Xunit" />
   </ItemGroup>

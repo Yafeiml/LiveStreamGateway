@@ -7,9 +7,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <ServerGarbageCollection>true</ServerGarbageCollection>
-    <Version>1.7.0</Version>
-    <AssemblyVersion>1.7.0</AssemblyVersion>
-    <FileVersion>1.7.0</FileVersion>
+    <Version>1.7.1</Version>
+    <AssemblyVersion>1.7.1</AssemblyVersion>
+    <FileVersion>1.7.1</FileVersion>
     <ApplicationIcon>assets\LiveStreamGateway.ico</ApplicationIcon>
     <DefaultItemExcludes>$(DefaultItemExcludes);dist\**;tests\**</DefaultItemExcludes>
   </PropertyGroup>

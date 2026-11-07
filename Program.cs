@@ -76,6 +76,10 @@ var app = builder.Build();
 var adminAuth = app.Services.GetRequiredService<AdminAuthService>();
 var playbackTokenRateLimiter = app.Services.GetRequiredService<PlaybackTokenRateLimiter>();
 
+// 密码、会话和令牌变更串行执行；等待后再经过下方鉴权，避免旧会话复活旧密码派生密钥。
+using var adminAuthMutationGate = new AdminAuthMutationGate();
+app.Use((HttpContext context, RequestDelegate next) => adminAuthMutationGate.InvokeAsync(context, next));
+
 // 管理 API 安全边界：播放链路及健康检查保持公开，其余 /api/* 必须持有登录会话。
 // SameSite=Strict 会话 Cookie 配合自定义请求头，阻断常见 CSRF 表单请求。
 app.Use(async (context, next) =>
@@ -124,6 +128,10 @@ app.Use(async (context, next) =>
 // Enable default files (index.html) and static files from wwwroot (Web UI)
 app.UseDefaultFiles();
 app.UseStaticFiles();
+
+// 图标无需管理会话；Windows、Linux 及单文件发布均从同一内嵌资源读取。
+app.MapGet("/favicon.ico", () => Results.Bytes(AppIconAssets.Favicon, "image/x-icon"));
+app.MapGet("/app-icon.png", () => Results.Bytes(AppIconAssets.LogoPng, "image/png"));
 
 // Ensure HLS directory exists for static files provider
 if (!Directory.Exists(Globals.HLS_FULL_PATH))
@@ -329,23 +337,11 @@ app.MapPost("/api/auth/change-password", async (AuthPasswordChangeRequest reques
     return Results.Ok(new { success = true });
 });
 
-app.MapPost("/api/playback-token/rotate", async (PlaybackTokenRotateRequest request, HttpContext context) =>
+app.MapPost("/api/playback-token/rotate", async (HttpContext context) =>
 {
-    if (request.CurrentPassword.Length > 256)
-        return Results.BadRequest(new { error = "密码格式无效" });
-
-    string clientKey = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-    bool valid = adminAuth.TryValidateCredentials(request.CurrentPassword, clientKey, out bool rateLimited, out TimeSpan retryAfter);
-    if (!valid)
-    {
-        if (rateLimited)
-        {
-            int seconds = Math.Max(1, (int)Math.Ceiling(retryAfter.TotalSeconds));
-            context.Response.Headers["Retry-After"] = seconds.ToString();
-            return Results.Json(new { error = "验证尝试过于频繁，请稍后再试", retryAfterSeconds = seconds }, statusCode: StatusCodes.Status429TooManyRequests);
-        }
-        return Results.Json(new { error = "当前管理员密码错误" }, statusCode: StatusCodes.Status403Forbidden);
-    }
+    if (!adminAuth.TryGetPlaybackTokenProtection(context.Request, out var sessionProtection))
+        return Results.Json(new { error = "管理会话无法恢复令牌密钥，请重新登录" }, statusCode: StatusCodes.Status401Unauthorized);
+    using var protection = sessionProtection!;
 
     string oldHash;
     string oldEncrypted;
@@ -358,7 +354,7 @@ app.MapPost("/api/playback-token/rotate", async (PlaybackTokenRotateRequest requ
     PlaybackTokenCredentials credentials;
     do
     {
-        credentials = PlaybackTokenProtector.Create(request.CurrentPassword);
+        credentials = PlaybackTokenProtector.Create(protection);
     }
     while (!string.IsNullOrWhiteSpace(oldHash) && PlaybackTokenProtector.ValidateToken(credentials.Token, oldHash));
 
@@ -380,7 +376,7 @@ app.MapPost("/api/playback-token/rotate", async (PlaybackTokenRotateRequest requ
 
     playbackTokenRateLimiter.ResetAll();
     adminAuth.InvalidateAllSessions();
-    string sessionToken = adminAuth.CreateSession(request.CurrentPassword);
+    string sessionToken = adminAuth.CreateSession(protection, credentials.Token);
     AdminAuthService.AppendSessionCookie(context.Response, sessionToken, context.Request.IsHttps);
     bool playbackTokenAuthEnabled;
     lock (Globals.ConfigLock)
@@ -2419,7 +2415,7 @@ public class ChannelMetrics
 
 public static class Globals
 {
-    public const string APP_VERSION = "v1.7.0";
+    public const string APP_VERSION = "v1.7.1";
     public const int HTTP_PORT = 9898;
     public const string HLS_DIR = "hls_stream";
     public const int HLS_MANIFEST_FRESH_SECONDS = 30;

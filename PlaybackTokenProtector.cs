@@ -20,12 +20,18 @@ public static class PlaybackTokenProtector
 
     public static PlaybackTokenCredentials Create(string adminPassword)
     {
+        using var protection = CreateSessionProtection(adminPassword);
+        return Create(protection);
+    }
+
+    internal static PlaybackTokenCredentials Create(PlaybackTokenEncryptionKey protection)
+    {
         string token = RandomNumberGenerator.GetInt32(0, 1_000_000)
             .ToString("D6", CultureInfo.InvariantCulture);
         return new PlaybackTokenCredentials(
             token,
             HashToken(token),
-            Protect(token, adminPassword));
+            protection.Protect(token));
     }
 
     public static string HashToken(string token) =>
@@ -54,14 +60,49 @@ public static class PlaybackTokenProtector
 
     public static string Protect(string token, string adminPassword)
     {
+        using var protection = CreateSessionProtection(adminPassword);
+        return protection.Protect(token);
+    }
+
+    // 已登录会话仅保留派生密钥，不保存管理员明文密码；沿用现有密文格式以兼容重新登录和改密。
+    internal static PlaybackTokenEncryptionKey CreateSessionProtection(string adminPassword, string? encoded = null)
+    {
+        int iterations = EncryptionIterations;
         byte[] salt = RandomNumberGenerator.GetBytes(SaltBytes);
-        byte[] nonce = RandomNumberGenerator.GetBytes(NonceBytes);
+        if (!string.IsNullOrWhiteSpace(encoded))
+        {
+            try
+            {
+                string[] parts = encoded.Split('$');
+                if (parts.Length == 6 && parts[0] == "aes-256-gcm" &&
+                    int.TryParse(parts[1], out int existingIterations) && existingIterations is >= 100_000 and <= 2_000_000)
+                {
+                    byte[] existingSalt = Convert.FromBase64String(parts[2]);
+                    if (existingSalt.Length >= SaltBytes)
+                    {
+                        iterations = existingIterations;
+                        salt = existingSalt;
+                    }
+                }
+            }
+            catch (FormatException)
+            {
+                // 损坏或缺失的令牌可由已登录管理员直接轮换修复。
+            }
+        }
+
         byte[] key = Rfc2898DeriveBytes.Pbkdf2(
             adminPassword,
             salt,
-            EncryptionIterations,
+            iterations,
             HashAlgorithmName.SHA256,
             KeyBytes);
+        return new PlaybackTokenEncryptionKey(iterations, salt, key);
+    }
+
+    internal static string Protect(string token, int iterations, byte[] salt, byte[] key)
+    {
+        byte[] nonce = RandomNumberGenerator.GetBytes(NonceBytes);
         byte[] plaintext = Encoding.UTF8.GetBytes(token);
         byte[] ciphertext = new byte[plaintext.Length];
         byte[] tag = new byte[TagBytes];
@@ -70,11 +111,10 @@ public static class PlaybackTokenProtector
         {
             using var aes = new AesGcm(key, TagBytes);
             aes.Encrypt(nonce, plaintext, ciphertext, tag, AssociatedData);
-            return $"aes-256-gcm${EncryptionIterations}${Convert.ToBase64String(salt)}${Convert.ToBase64String(nonce)}${Convert.ToBase64String(ciphertext)}${Convert.ToBase64String(tag)}";
+            return $"aes-256-gcm${iterations}${Convert.ToBase64String(salt)}${Convert.ToBase64String(nonce)}${Convert.ToBase64String(ciphertext)}${Convert.ToBase64String(tag)}";
         }
         finally
         {
-            CryptographicOperations.ZeroMemory(key);
             CryptographicOperations.ZeroMemory(plaintext);
         }
     }
@@ -151,3 +191,38 @@ public static class PlaybackTokenProtector
 }
 
 public sealed record PlaybackTokenCredentials(string Token, string Hash, string Encrypted);
+
+/// <summary>仅在管理会话有效期内驻留内存的恢复密钥，注销、过期或作废时清零。</summary>
+internal sealed class PlaybackTokenEncryptionKey(int iterations, byte[] salt, byte[] key) : IDisposable
+{
+    private readonly object _syncRoot = new();
+    private bool _disposed;
+
+    internal string Protect(string token)
+    {
+        lock (_syncRoot)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return PlaybackTokenProtector.Protect(token, iterations, salt, key);
+        }
+    }
+
+    internal bool TryClone(out PlaybackTokenEncryptionKey? copy)
+    {
+        lock (_syncRoot)
+        {
+            copy = _disposed ? null : new PlaybackTokenEncryptionKey(iterations, (byte[])salt.Clone(), (byte[])key.Clone());
+            return copy != null;
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_syncRoot)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            CryptographicOperations.ZeroMemory(key);
+        }
+    }
+}

@@ -7,7 +7,7 @@ namespace LiveStreamGateway;
 /// <summary>EXE 和托盘共用同一份多尺寸图标，不依赖发布目录中的外部文件。</summary>
 internal static class WindowsAppIcon
 {
-    internal const string ResourceName = "LiveStreamGateway.AppIcon.ico";
+    internal const string ResourceName = AppIconAssets.ResourceName;
 
     internal static Icon LoadForTray()
     {
