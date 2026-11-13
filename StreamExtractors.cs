@@ -470,13 +470,42 @@ namespace LiveStreamGateway
         }
     }
 
+    public sealed class HuyaLineCandidate
+    {
+        public string Key { get; }
+        public string CdnType { get; }
+        public string Host { get; }
+        internal string BaseUrl { get; }
+        internal string StreamName { get; }
+        internal string Suffix { get; }
+        internal string AntiCode { get; }
+        internal string Ratio { get; }
+
+        internal HuyaLineCandidate(string cdnType, Uri baseUri, string streamName, string suffix,
+            string antiCode, string ratio)
+        {
+            CdnType = cdnType.ToUpperInvariant();
+            Host = baseUri.IdnHost;
+            BaseUrl = baseUri.GetLeftPart(UriPartial.Path).TrimEnd('/');
+            // A refreshed signature or stream name must not reset line health/selection.
+            Key = $"{CdnType}|{BaseUrl}";
+            StreamName = streamName;
+            Suffix = suffix;
+            AntiCode = antiCode;
+            Ratio = ratio;
+        }
+
+        public override string ToString() => $"{CdnType}@{Host}";
+    }
+
     public class HuyaExtractor : BaseExtractor
     {
-        private string? _sHlsUrl;
-        private string? _sStreamName;
-        private string? _sHlsUrlSuffix;
-        private string? _sHlsAntiCode;
-        private string _ratioParam = "";
+        private sealed record LineSnapshot(IReadOnlyList<HuyaLineCandidate> Candidates, HuyaLineCandidate? Selected);
+        private LineSnapshot _lines = new(Array.AsReadOnly(Array.Empty<HuyaLineCandidate>()), null);
+        private readonly object _lineGate = new();
+
+        public IReadOnlyList<HuyaLineCandidate> Candidates => System.Threading.Volatile.Read(ref _lines).Candidates;
+        public HuyaLineCandidate? SelectedLine => System.Threading.Volatile.Read(ref _lines).Selected;
 
         private readonly long _uid;
         private readonly long _initUuid;
@@ -492,10 +521,62 @@ namespace LiveStreamGateway
 
         public string GetFreshUrl()
         {
-            if (string.IsNullOrEmpty(_sHlsUrl) || string.IsNullOrEmpty(_sStreamName))
-                return "";
-            string newAntiCode = GetAntiCode(_sHlsAntiCode!, _sStreamName!);
-            return $"{_sHlsUrl}/{_sStreamName}.{_sHlsUrlSuffix}?{newAntiCode}&ratio={_ratioParam}";
+            var selected = System.Threading.Volatile.Read(ref _lines).Selected;
+            return selected == null ? "" : GetFreshUrl(selected);
+        }
+
+        public string GetFreshUrl(HuyaLineCandidate candidate)
+        {
+            ArgumentNullException.ThrowIfNull(candidate);
+            string newAntiCode = GetAntiCode(candidate.AntiCode, candidate.StreamName);
+            return $"{candidate.BaseUrl}/{candidate.StreamName}.{candidate.Suffix}?{newAntiCode}&ratio={candidate.Ratio}";
+        }
+
+        public bool TrySelectLine(string key)
+        {
+            lock (_lineGate)
+            {
+                var state = _lines;
+                var selected = state.Candidates.FirstOrDefault(line => line.Key == key);
+                if (selected == null) return false;
+                System.Threading.Volatile.Write(ref _lines, new LineSnapshot(state.Candidates, selected));
+                return true;
+            }
+        }
+
+        internal bool InstallCandidates(JsonArray? streamInfoList, string quality)
+        {
+            string ratio = quality switch { "UHD" => "4000", "HD" => "2000", "SD" => "1000", _ => "" };
+            var candidates = new List<HuyaLineCandidate>();
+            foreach (var item in streamInfoList ?? new JsonArray())
+            {
+                if (item is not JsonObject obj) continue;
+                string ReadString(string key, string fallback = "") =>
+                    obj[key] is JsonValue value && value.TryGetValue<string>(out var text) ? text : fallback;
+                var baseUrl = ReadString("sHlsUrl");
+                var streamName = ReadString("sStreamName");
+                var suffix = ReadString("sHlsUrlSuffix", "m3u8").TrimStart('.');
+                if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri) ||
+                    (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps) ||
+                    !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Query) ||
+                    !string.IsNullOrEmpty(uri.Fragment) || string.IsNullOrWhiteSpace(streamName) ||
+                    streamName.IndexOfAny(['/', '\\', '?', '#', '\r', '\n']) >= 0 ||
+                    !string.Equals(suffix, "m3u8", StringComparison.OrdinalIgnoreCase)) continue;
+                var candidate = new HuyaLineCandidate(ReadString("sCdnType", "UNKNOWN"), uri, streamName,
+                    suffix, ReadString("sHlsAntiCode"), ratio);
+                if (candidates.All(existing => existing.Key != candidate.Key)) candidates.Add(candidate);
+            }
+            if (candidates.Count == 0) return false;
+            var snapshot = Array.AsReadOnly(candidates.ToArray());
+            lock (_lineGate)
+            {
+                var previousKey = _lines.Selected?.Key;
+                var selected = snapshot.FirstOrDefault(line => line.Key == previousKey)
+                    ?? new[] { "TX", "HW", "AL", "HS" }.Select(cdn => snapshot.FirstOrDefault(line => line.CdnType == cdn))
+                        .FirstOrDefault(line => line != null) ?? snapshot[0];
+                System.Threading.Volatile.Write(ref _lines, new LineSnapshot(snapshot, selected));
+            }
+            return true;
         }
 
         private Dictionary<string, string> ParseQueryString(string query)
@@ -504,7 +585,7 @@ namespace LiveStreamGateway
             var parts = query.TrimStart('?').Split('&');
             foreach (var p in parts)
             {
-                var kv = p.Split('=');
+                var kv = p.Split('=', 2);
                 if (kv.Length == 2) dict[kv[0]] = Uri.UnescapeDataString(kv[1]);
                 else if (kv.Length == 1) dict[kv[0]] = "";
             }
@@ -538,17 +619,6 @@ namespace LiveStreamGateway
         {
             try
             {
-                // 1. 码率参数映射
-                _ratioParam = quality switch
-                {
-                    "OD" => "",
-                    "BD" => "",
-                    "UHD" => "4000",
-                    "HD" => "2000",
-                    "SD" => "1000",
-                    _ => ""
-                };
-
                 // 2. 解析房间号 (支持别名转换)
                 string roomId = url.Split('?')[0].TrimEnd('/').Split('/').Last();
                 if (roomId.Any(char.IsLetter))
@@ -590,38 +660,19 @@ namespace LiveStreamGateway
                     {
                         var pcJsonStr = pcMatch.Groups[1].Value + "}";
                         var pcJson = JsonNode.Parse(pcJsonStr);
-                        var streamInfo = pcJson?["data"]?[0]?["gameStreamInfoList"]?[0];
-                        if (streamInfo != null)
+                        var streamInfoList = pcJson?["data"]?[0]?["gameStreamInfoList"] as JsonArray;
+                        if (InstallCandidates(streamInfoList, quality))
                         {
-                            _sStreamName = streamInfo["sStreamName"]?.GetValue<string>() ?? "";
-                            _sHlsUrl = streamInfo["sHlsUrl"]?.GetValue<string>() ?? "";
-                            _sHlsUrlSuffix = streamInfo["sHlsUrlSuffix"]?.GetValue<string>() ?? "m3u8";
-                            _sHlsAntiCode = streamInfo["sHlsAntiCode"]?.GetValue<string>() ?? "";
-                            string newAntiCode = GetAntiCode(_sHlsAntiCode, _sStreamName);
-                            return $"{_sHlsUrl}/{_sStreamName}.{_sHlsUrlSuffix}?{newAntiCode}&ratio={_ratioParam}";
+                            return GetFreshUrl();
                         }
                     }
                 }
 
                 // 4. 多 CDN 优先级优选 (TX > HW > AL > HS > 首选)
                 var baseSteamInfoList = json?["data"]?["stream"]?["baseSteamInfoList"]?.AsArray();
-                if (baseSteamInfoList != null && baseSteamInfoList.Count > 0)
+                if (InstallCandidates(baseSteamInfoList, quality))
                 {
-                    var selectedItem = baseSteamInfoList.FirstOrDefault(x => x?["sCdnType"]?.GetValue<string>() == "TX")
-                                       ?? baseSteamInfoList.FirstOrDefault(x => x?["sCdnType"]?.GetValue<string>() == "HW")
-                                       ?? baseSteamInfoList.FirstOrDefault(x => x?["sCdnType"]?.GetValue<string>() == "AL")
-                                       ?? baseSteamInfoList[0];
-
-                    if (selectedItem != null)
-                    {
-                        _sStreamName = selectedItem["sStreamName"]?.GetValue<string>() ?? "";
-                        _sHlsUrl = selectedItem["sHlsUrl"]?.GetValue<string>() ?? "";
-                        _sHlsUrlSuffix = selectedItem["sHlsUrlSuffix"]?.GetValue<string>() ?? "m3u8";
-                        _sHlsAntiCode = selectedItem["sHlsAntiCode"]?.GetValue<string>() ?? "";
-                        string newAntiCode = GetAntiCode(_sHlsAntiCode, _sStreamName);
-                    string m3u8Url = $"{_sHlsUrl}/{_sStreamName}.{_sHlsUrlSuffix}?{newAntiCode}&ratio={_ratioParam}";
-                        return m3u8Url;
-                    }
+                    return GetFreshUrl();
                 }
                 
                 throw new Exception("Cookie Invalid (Cookie失效或需登录)");

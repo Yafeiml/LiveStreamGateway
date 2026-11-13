@@ -2353,7 +2353,8 @@ public enum MediaFaultKind
     HuyaContinuity,
     TimestampDiscontinuity,
     NonMonotonicDts,
-    SegmentSkip
+    SegmentSkip,
+    TransportFailure
 }
 
 public sealed record MediaFaultSignal(
@@ -2365,7 +2366,9 @@ public sealed record MediaFaultSignal(
     string Category,
     string Detail,
     bool RequiresImmediateRecovery,
-    int Weight = 1);
+    int Weight = 1,
+    string? SegmentIdentity = null,
+    long RouteGeneration = 0);
 
 public class M3u8CacheEntry
 {
@@ -2415,7 +2418,7 @@ public class ChannelMetrics
 
 public static class Globals
 {
-    public const string APP_VERSION = "v1.7.1";
+    public const string APP_VERSION = "v1.7.2";
     public const int HTTP_PORT = 9898;
     public const string HLS_DIR = "hls_stream";
     public const int HLS_MANIFEST_FRESH_SECONDS = 30;
@@ -2802,14 +2805,11 @@ public class RenderService : BackgroundService
     }
 }
 
-public class StreamManagerService : BackgroundService, IAsyncDisposable
+public partial class StreamManagerService : BackgroundService, IAsyncDisposable
 {
     private const int HEALTH_CHECK_SECONDS = 10;
     private const int STALE_THRESHOLD_SECONDS = 30;
     private const int MEDIA_FAULT_WINDOW_SECONDS = 30;
-    private const int AUTO_RECOVERY_COOLDOWN_SECONDS = 90;
-    private const int AUTO_RECOVERY_HISTORY_MINUTES = 10;
-    private const int AUTO_RECOVERY_MAX_PER_WINDOW = 3;
     private static readonly string? FFMPEG_EXE_PATH = ResolveFfmpegPath();
     public static bool IsFfmpegAvailable => !string.IsNullOrEmpty(FFMPEG_EXE_PATH) && File.Exists(FFMPEG_EXE_PATH);
 
@@ -2829,7 +2829,8 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
     // reader/HTTP 代理只投递故障信号；唯一的后台状态机线程负责判定和重启，避免 reader 自等待死锁。
     private readonly ConcurrentQueue<MediaFaultSignal> _mediaFaultSignals = new();
     private readonly ConcurrentDictionary<string, List<MediaFaultSignal>> _recentMediaFaults = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, Queue<DateTime>> _automaticRecoveryHistory = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, AutomaticRecoveryBudget> _automaticRecoveryBudgets = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, DateTime> _automaticRetryNotBefore = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, PendingMediaRecovery> _pendingMediaRecoveries = new(StringComparer.Ordinal);
 
     // 触发器：API 更新配置时立即唤醒巡检
@@ -2837,7 +2838,7 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
     private DateTime _lastCookieCheckTime = DateTime.MinValue;
 
     private sealed record PendingMediaRecovery(
-        MediaFaultSignal Signal, DateTime RetryAtUtc, HlsOutputProgress? OutputBaseline);
+        MediaFaultSignal Signal, DateTime RetryAtUtc, HlsOutputProgress? OutputBaseline, DateTime LastSeenAtUtc);
 
     public StreamManagerService()
     {
@@ -2880,7 +2881,7 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
     }
 
     private static void LogLifecycle(string channelId, string eventName, string details) =>
-        Console.WriteLine($"[StreamLifecycle] channel={SafeLogValue(channelId)} event={SafeLogValue(eventName)} {SafeLogValue(details)}");
+        Console.WriteLine($"{DateTime.UtcNow:O} [StreamLifecycle] channel={SafeLogValue(channelId)} event={SafeLogValue(eventName)} {SafeLogValue(details)}");
 
     public void NotifyConfigChanged()
     {
@@ -2947,6 +2948,7 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
 
             _pendingMediaRecoveries.TryRemove(channelId, out _);
             _recentMediaFaults.TryRemove(channelId, out _);
+            _automaticRetryNotBefore.TryRemove(channelId, out _);
             Globals.CancelContinuityRecovery(channelId, clearDegraded: true);
             Globals.RecordRestart(channelId, "manual");
             LogLifecycle(channelId, "restart", "reason=manual");
@@ -2966,6 +2968,7 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
     /// <summary>停止并释放单个频道的 FFmpeg 会话（线程安全，正确释放所有资源）</summary>
     public async Task StopSessionAsync(string channelId)
     {
+        CancelHuyaProbe(channelId);
         Task? disposal = null;
         lock (_sessionLifecycleLock)
         {
@@ -3002,8 +3005,11 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
         _lastProbeTimes.TryRemove(channelId, out _);
         _startupLocks.TryRemove(channelId, out _);
         _recentMediaFaults.TryRemove(channelId, out _);
-        _automaticRecoveryHistory.TryRemove(channelId, out _);
+        _automaticRecoveryBudgets.TryRemove(channelId, out _);
+        _automaticRetryNotBefore.TryRemove(channelId, out _);
         _pendingMediaRecoveries.TryRemove(channelId, out _);
+        _huyaLineStates.TryRemove(channelId, out _);
+        CancelHuyaProbe(channelId);
     }
 
     private static void RemovePublishedPlaylist(string channelId)
@@ -3091,6 +3097,12 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
             }
             catch { continue; }
 
+            if (signal.Kind == MediaFaultKind.TransportFailure)
+            {
+                RecordHuyaTransportFailure(signal);
+                continue;
+            }
+
             Globals.RecordContinuitySignal(signal.ChannelId, signal.Category);
 
             if (!_recentMediaFaults.TryGetValue(signal.ChannelId, out var recent) ||
@@ -3102,8 +3114,9 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
 
             recent.RemoveAll(item => item.OccurredAtUtc < cutoff);
             recent.Add(signal);
+            if (recent.Count > 256) recent.RemoveRange(0, recent.Count - 256);
 
-            var strongEvidence = MediaRecoveryPolicy.SelectStrongEvidence(recent, currentSession.CreatedAtUtc);
+            var strongEvidence = MediaRecoveryPolicy.SelectStrongEvidence(recent, currentSession.CreatedAtUtc, DateTime.UtcNow);
             if (strongEvidence == null)
             {
                 // 保留最早的观察基线；后续轻微告警不能反复推迟截止时间，更不能覆盖排队的强异常。
@@ -3114,10 +3127,15 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
                     _pendingMediaRecoveries[signal.ChannelId] = new PendingMediaRecovery(
                         observedSignal,
                         DateTime.UtcNow.AddSeconds(MediaRecoveryPolicy.ObservationSeconds),
-                        ReadOutputProgress(signal.ChannelId));
-                    LogLifecycle(signal.ChannelId, "media-continuity-observed",
+                        ReadOutputProgress(signal.ChannelId), signal.OccurredAtUtc);
+                    LogHuyaEvent(signal.ChannelId, "media-continuity-observed",
                         $"category={signal.Category} sessionId={ShortSessionId(signal.SessionId)} pid={signal.ProcessId} " +
                         $"action=check-output-progress detail={SafeLogValue(signal.Detail)}");
+                }
+                else
+                {
+                    _pendingMediaRecoveries[signal.ChannelId] = existing with
+                    { LastSeenAtUtc = signal.OccurredAtUtc };
                 }
                 continue;
             }
@@ -3127,13 +3145,13 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
             string detail = SafeLogValue(strongEvidence.Detail);
             Globals.RecordContinuityAnomaly(signal.ChannelId, strongEvidence.Category, detail);
             recoveryDecisions[signal.ChannelId] = strongEvidence;
-            LogLifecycle(
+            LogHuyaEvent(
                 signal.ChannelId,
                 "media-continuity-anomaly",
                 $"category={strongEvidence.Category} sessionId={ShortSessionId(signal.SessionId)} pid={signal.ProcessId} detail={detail}");
         }
 
-        // 弱异常每轮复核真实分片增长；强异常仍保留冷却后的恢复，避免音频损坏被新清单掩盖。
+        // 冷却到期也必须重核证据的新鲜度，不能把数分钟前的强告警当作当前损坏。
         foreach (var pending in _pendingMediaRecoveries.ToArray())
         {
             MediaFaultSignal signal = pending.Value.Signal;
@@ -3160,25 +3178,29 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
                 continue;
             }
             if (recoveryDecisions.ContainsKey(signal.ChannelId)) continue;
-            if (MediaRecoveryPolicy.CanCancelObservation(
-                signal, pending.Value.OutputBaseline, ReadOutputProgress(signal.ChannelId), DateTime.UtcNow))
+            _recentMediaFaults.TryGetValue(signal.ChannelId, out var recent);
+            var evaluation = MediaRecoveryPolicy.EvaluatePendingRecovery(signal, pending.Value.LastSeenAtUtc,
+                recent ?? [], pending.Value.OutputBaseline, ReadOutputProgress(signal.ChannelId),
+                session.CreatedAtUtc, DateTime.UtcNow);
+            if (evaluation.Disposition == MediaRecoveryDisposition.CancelObservation)
             {
                 _pendingMediaRecoveries.TryRemove(pending.Key, out _);
                 Globals.CancelContinuityRecovery(signal.ChannelId, clearDegraded: true);
-                LogLifecycle(signal.ChannelId, "media-continuity-observation-cleared",
+                LogHuyaEvent(signal.ChannelId, "media-continuity-observation-cleared",
                     $"category={signal.Category} sessionId={ShortSessionId(signal.SessionId)} pid={signal.ProcessId} " +
-                    "reason=output-progressing");
+                    $"reason={evaluation.Reason}");
                 continue;
             }
+            if (evaluation.Disposition != MediaRecoveryDisposition.Recover) continue;
             if (pending.Value.RetryAtUtc > DateTime.UtcNow) continue;
             if (!signal.RequiresImmediateRecovery)
             {
                 Globals.RecordContinuityAnomaly(signal.ChannelId, signal.Category, signal.Detail);
-                LogLifecycle(signal.ChannelId, "media-continuity-anomaly",
+                LogHuyaEvent(signal.ChannelId, "media-continuity-anomaly",
                     $"category={signal.Category} sessionId={ShortSessionId(signal.SessionId)} pid={signal.ProcessId} " +
                     "reason=output-not-recovered");
             }
-            recoveryDecisions.TryAdd(signal.ChannelId, signal);
+            recoveryDecisions.TryAdd(signal.ChannelId, evaluation.Evidence ?? signal);
         }
 
         foreach (var decision in recoveryDecisions.Values)
@@ -3196,96 +3218,8 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
         MediaFaultSignal signal,
         CancellationToken stoppingToken)
     {
-        DateTime now = DateTime.UtcNow;
-        if (!_automaticRecoveryHistory.TryGetValue(channel.Id, out var history))
-        {
-            history = new Queue<DateTime>();
-            _automaticRecoveryHistory[channel.Id] = history;
-        }
-
-        DateTime historyCutoff = now.AddMinutes(-AUTO_RECOVERY_HISTORY_MINUTES);
-        while (history.Count > 0 && history.Peek() < historyCutoff)
-            history.Dequeue();
-
-        string? suppressionReason = null;
-        int retryAfterSeconds = 0;
-        if (history.Count > 0 && now - history.Last() < TimeSpan.FromSeconds(AUTO_RECOVERY_COOLDOWN_SECONDS))
-        {
-            suppressionReason = "cooldown";
-            retryAfterSeconds = Math.Max(1, AUTO_RECOVERY_COOLDOWN_SECONDS - (int)(now - history.Last()).TotalSeconds);
-        }
-        else if (history.Count >= AUTO_RECOVERY_MAX_PER_WINDOW)
-        {
-            suppressionReason = "rate-limit";
-            retryAfterSeconds = Math.Max(1, (int)Math.Ceiling(
-                (history.Peek().AddMinutes(AUTO_RECOVERY_HISTORY_MINUTES) - now).TotalSeconds));
-        }
-
-        if (suppressionReason != null)
-        {
-            DateTime retryAtUtc = DateTime.UtcNow.AddSeconds(retryAfterSeconds);
-            _pendingMediaRecoveries.TryGetValue(channel.Id, out var existing);
-            bool sameSession = existing != null && existing.Signal.SessionId == signal.SessionId;
-            // 优先保留已确认的时间线损坏，后续网络抖动不能把它降级为可取消的观察任务。
-            MediaFaultSignal retainedSignal = sameSession && existing!.Signal.RequiresImmediateRecovery
-                ? existing.Signal : signal;
-            _pendingMediaRecoveries[channel.Id] = new PendingMediaRecovery(
-                retainedSignal,
-                retryAtUtc,
-                sameSession ? existing!.OutputBaseline : ReadOutputProgress(channel.Id));
-            Globals.MarkContinuityRecoveryPending(channel.Id, signal.SessionId, retryAtUtc);
-            LogLifecycle(
-                channel.Id,
-                "media-continuity-recovery-suppressed",
-                $"category={signal.Category} sessionId={ShortSessionId(signal.SessionId)} pid={signal.ProcessId} " +
-                $"detail={SafeLogValue(signal.Detail)} reason={suppressionReason} retryAfterSeconds={retryAfterSeconds}");
-            Globals.UpdateStatus(channel.Id, "检测到媒体连续性异常，自动恢复处于冷却期", ConsoleColor.Yellow);
-            return;
-        }
-
-        var startLock = _startupLocks.GetOrAdd(channel.Id, _ => new SemaphoreSlim(1, 1));
-        await startLock.WaitAsync(stoppingToken);
-        try
-        {
-            if (!_sessions.TryGetValue(channel.Id, out var currentSession) ||
-                !string.Equals(currentSession.SessionId, signal.SessionId, StringComparison.Ordinal))
-                return;
-
-            try
-            {
-                if (currentSession.Process.HasExited || currentSession.Process.Id != signal.ProcessId)
-                    return;
-            }
-            catch { return; }
-
-            _pendingMediaRecoveries.TryRemove(channel.Id, out _);
-            Globals.ClearContinuityRecoveryPending(channel.Id, signal.SessionId);
-
-            // 在停止 FFmpeg 和清理当前分片之前，尽力保留清单、当前引用分片及日志。
-            string? diagnosticPath = await MediaDiagnostics.CaptureAsync(channel.Id, currentSession, signal, stoppingToken);
-            history.Enqueue(DateTime.UtcNow);
-            Globals.MarkContinuityRecoveryStarted(channel.Id);
-            Globals.RecordRestart(channel.Id, "media-continuity");
-            Globals.RecordError(channel.Id);
-            LogLifecycle(
-                channel.Id,
-                "restart",
-                $"reason=media-continuity category={signal.Category} sessionId={ShortSessionId(signal.SessionId)} " +
-                $"pid={signal.ProcessId} diagnostics={(diagnosticPath == null ? "unavailable" : "saved")}");
-            Globals.UpdateState(channel.Id, ChannelState.Restarting);
-            Globals.UpdateStatus(channel.Id, "检测到媒体时间线异常，正在自动重建推流...", ConsoleColor.Yellow);
-
-            await StopSessionAsync(channel.Id);
-            await ResetSourceStateAsync(channel, stoppingToken);
-
-            var status = Globals.ChannelStatuses.FirstOrDefault(item => item.Id == channel.Id);
-            if (status != null)
-                await StartSingleChannelCoreAsync(channel, status, stoppingToken);
-        }
-        finally
-        {
-            startLock.Release();
-        }
+        if (!_sessions.TryGetValue(channel.Id, out var session) || session.SessionId != signal.SessionId) return;
+        await TryRecoverChannelAsync(channel, session, "media-continuity", stoppingToken, signal);
     }
 
     private static HlsOutputProgress? ReadOutputProgress(string channelId) =>
@@ -3396,7 +3330,7 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
             string streamingMode;
             lock (Globals.ConfigLock)
             {
-                currentChannels = [.. Globals.Config.Channels];
+                currentChannels = Globals.Config.Channels.Select(SnapshotChannel).ToList();
                 streamingMode = Globals.Config.StreamingMode;
             }
 
@@ -3424,6 +3358,7 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
             // 所有 reader / Huya HTTP 请求只会把事件投入队列；在此统一校验 sessionId/PID、
             // 保存证据并复用频道启动锁执行自愈。
             await ProcessMediaFaultSignalsAsync(currentChannels, stoppingToken);
+            await ProcessHuyaProbesAsync(currentChannels, stoppingToken);
 
             int idleTimeoutSeconds;
             lock (Globals.ConfigLock) { idleTimeoutSeconds = Globals.Config.IdleTimeoutSeconds; }
@@ -3543,8 +3478,7 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
 
                     if (isStuckStarting)
                     {
-                        Globals.RecordRestart(channel.Id, "state-stuck");
-                        LogLifecycle(channel.Id, "restart", $"reason=state-stuck state={currentState}");
+                        LogLifecycle(channel.Id, "startup-state-recheck", $"state={currentState}");
                     }
 
                     if (!probeThrottled &&
@@ -3559,17 +3493,12 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
                 // -- 检查现有会话健康状态 --
                 if (hasSession && session != null)
                 {
-                    if (session.Process.HasExited)
+                    if (!SessionHasExited(session) &&
+                        TryScheduleHuyaProbe(channel, session, IsOutputStale(channel.Id, session, DateTime.UtcNow)))
+                        continue;
+                    if (SessionHasExited(session))
                     {
-                        int? exitCode = null;
-                        try { exitCode = session.Process.ExitCode; } catch { }
-                        Globals.RecordRestart(channel.Id, "ffmpeg-exited");
-                        Globals.RecordError(channel.Id);
-                        LogLifecycle(channel.Id, "restart", $"reason=ffmpeg-exited exitCode={exitCode?.ToString() ?? "unknown"}");
-                        Globals.UpdateStatus(channel.Id, "FFmpeg 进程已退出，正在重启...", ConsoleColor.Yellow);
-                        Globals.UpdateState(channel.Id, ChannelState.Restarting);
-                        await StopSessionAsync(channel.Id);
-                        await StartSingleChannelAsync(channel, status, stoppingToken);
+                        await TryRecoverChannelAsync(channel, session, "ffmpeg-exited", stoppingToken);
                     }
                     else
                     {
@@ -3581,14 +3510,7 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
                             var lastWrite = File.GetLastWriteTimeUtc(m3u8Path);
                             if ((DateTime.UtcNow - lastWrite).TotalSeconds > STALE_THRESHOLD_SECONDS)
                             {
-                                double manifestAgeSeconds = (DateTime.UtcNow - lastWrite).TotalSeconds;
-                                Globals.RecordRestart(channel.Id, "manifest-stale");
-                                Globals.RecordError(channel.Id);
-                                LogLifecycle(channel.Id, "restart", $"reason=manifest-stale ageSeconds={manifestAgeSeconds:F1}");
-                                Globals.UpdateStatus(channel.Id, "HLS 文件陈旧（推流卡死），正在强制重启...", ConsoleColor.Red);
-                                Globals.UpdateState(channel.Id, ChannelState.Restarting);
-                                await StopSessionAsync(channel.Id);
-                                await StartSingleChannelAsync(channel, status, stoppingToken);
+                                await TryRecoverChannelAsync(channel, session, "manifest-stale", stoppingToken);
                             }
                             else
                             {
@@ -3599,7 +3521,7 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
                                     LogLifecycle(
                                         channel.Id,
                                         "media-continuity-recovered",
-                                        $"sessionId={ShortSessionId(session.SessionId)} pid={session.Process.Id}");
+                                        $"sessionId={ShortSessionId(session.SessionId)} pid={session.ProcessId}");
                                 }
                                 else
                                 {
@@ -3614,50 +3536,8 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
                             int startupTimeout = Globals.Config.StartupTimeoutSeconds > 0 ? Globals.Config.StartupTimeoutSeconds : 30;
                             if ((DateTime.UtcNow - session.CreatedAtUtc).TotalSeconds > startupTimeout)
                             {
-                                double sessionAgeSeconds = (DateTime.UtcNow - session.CreatedAtUtc).TotalSeconds;
-                                LogLifecycle(channel.Id, "startup-timeout", $"ageSeconds={sessionAgeSeconds:F1} timeoutSeconds={startupTimeout}");
-
-                                // 终止卡死/无响应的 FFmpeg 会话
-                                await StopSessionAsync(channel.Id);
-
-                                // 探测上游直播源是否已下播或鉴权失效
-                                var (probeUrl, probeErr) = await GetSourceStreamUrlAsync(channel, stoppingToken);
-                                bool isOfflineResult = IsOfflineResult(probeErr);
-                                Globals.RecordProbe(channel.Id, isOfflineResult);
-                                if (string.IsNullOrEmpty(probeUrl))
-                                {
-                                    if (isOfflineResult)
-                                    {
-                                        Globals.CancelContinuityRecovery(channel.Id, clearDegraded: true);
-                                        Globals.UpdateStatus(channel.Id, "未开播", ConsoleColor.DarkYellow);
-                                        Globals.UpdateState(channel.Id, ChannelState.Offline);
-                                        status.RetryCount = 0;
-                                    }
-                                    else if (IsAuthenticationError(probeErr))
-                                    {
-                                        Globals.CancelContinuityRecovery(channel.Id, clearDegraded: false);
-                                        Globals.RecordError(channel.Id);
-                                        Globals.UpdateStatus(channel.Id, "Cookie失效或需登录", ConsoleColor.Red);
-                                        Globals.UpdateState(channel.Id, ChannelState.Error);
-                                    }
-                                    else
-                                    {
-                                        Globals.CancelContinuityRecovery(channel.Id, clearDegraded: false);
-                                        Globals.RecordError(channel.Id);
-                                        Globals.UpdateStatus(channel.Id, $"获取源失败: {probeErr}", ConsoleColor.Red);
-                                        Globals.UpdateState(channel.Id, ChannelState.Error);
-                                    }
-                                }
-                                else
-                                {
-                                    // 上游在线但推流进程启动超时，触发重启重试
-                                    Globals.RecordError(channel.Id);
-                                    Globals.RecordRestart(channel.Id, "startup-timeout");
-                                    LogLifecycle(channel.Id, "restart", "reason=startup-timeout upstream=online");
-                                    Globals.UpdateStatus(channel.Id, "推流启动超时，正在重试...", ConsoleColor.Yellow);
-                                    Globals.UpdateState(channel.Id, ChannelState.Restarting);
-                                    await StartSingleChannelAsync(channel, status, stoppingToken);
-                                }
+                                // 与时间线故障、切线和退出共用预算；重建时重新解析并保留上下播分类。
+                                await TryRecoverChannelAsync(channel, session, "startup-timeout", stoppingToken);
                             }
                         }
                     }
@@ -3827,6 +3707,8 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
         try
         {
             if (IsChannelSessionRunning(channel.Id)) return;
+            if (_automaticRetryNotBefore.TryGetValue(channel.Id, out var retryAt) && retryAt > DateTime.UtcNow)
+                return;
             if (_sessions.ContainsKey(channel.Id))
                 await StopSessionAsync(channel.Id);
             await StartSingleChannelCoreAsync(channel, status, ct);
@@ -3837,7 +3719,11 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
         }
     }
 
-    private async Task StartSingleChannelCoreAsync(ChannelConfig channel, ChannelStatus status, CancellationToken ct)
+    private Task StartSingleChannelCoreAsync(ChannelConfig channel, ChannelStatus status, CancellationToken ct) =>
+        StartSingleChannelGuardedAsync(channel, status, ct, expectedFingerprint: null);
+
+    private async Task StartSingleChannelGuardedAsync(ChannelConfig channel, ChannelStatus status, CancellationToken ct,
+        string? expectedFingerprint)
     {
         string channelHlsDir = Path.Combine(Globals.HLS_FULL_PATH, channel.Id);
         try
@@ -3911,7 +3797,22 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
         {
             // 源解析期间可能已点击退出。创建和发布会话必须与关闭封口互斥。
             if (_stopping || ct.IsCancellationRequested) return;
-            var newSession = CreateSession(channel.Id, inputUrl, channelHlsDir, channel.Platform ?? "");
+            if (expectedFingerprint != null)
+            {
+                lock (Globals.ConfigLock)
+                    if (!Globals.Config.Channels.Any(item => item.Enable && item.Id == channel.Id &&
+                        SourceFingerprint(item) == expectedFingerprint)) return;
+            }
+            string sessionId = Guid.NewGuid().ToString("N");
+            long generation = 0;
+            if (string.Equals(channel.Platform, "huya", StringComparison.OrdinalIgnoreCase) &&
+                Globals.Extractors.TryGetValue(channel.Id, out var raw) && raw is HuyaExtractor huya &&
+                huya.SelectedLine is { } selected)
+            {
+                var state = GetHuyaLineState(channel);
+                lock (state) generation = state.BindSession(sessionId, selected.Key, DateTime.UtcNow);
+            }
+            var newSession = CreateSession(channel.Id, inputUrl, channelHlsDir, channel.Platform ?? "", sessionId, generation);
             if (newSession != null)
             {
                 _sessions[channel.Id] = newSession;
@@ -3921,6 +3822,10 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
                 var metrics = Globals.Metrics.GetOrAdd(channel.Id, _ => new ChannelMetrics());
                 lock (metrics) metrics.StartCount++;
                 LogLifecycle(channel.Id, "started", $"pid={newSession.Process.Id}");
+                if (Globals.Extractors.TryGetValue(channel.Id, out var startedExtractor) &&
+                    startedExtractor is HuyaExtractor startedHuya && startedHuya.SelectedLine is { } startedLine)
+                    LogHuyaEvent(channel.Id, "line-bound",
+                        $"session={ShortSessionId(newSession.SessionId)} generation={newSession.RouteGeneration} line={startedLine}");
             }
             else
             {
@@ -3933,10 +3838,12 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
         }
     }
 
-    private static async Task<(string? Url, string? Error)> GetSourceStreamUrlAsync(ChannelConfig channel, CancellationToken ct)
+    private async Task<(string? Url, string? Error)> GetSourceStreamUrlAsync(ChannelConfig channel, CancellationToken ct)
     {
         try
         {
+            var lineState = string.Equals(channel.Platform, "huya", StringComparison.OrdinalIgnoreCase)
+                ? GetHuyaLineState(channel) : null;
             if (!Globals.Extractors.TryGetValue(channel.Id, out var extractor))
             {
                 extractor = channel.Platform?.ToLower() switch
@@ -3950,6 +3857,14 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
             }
 
             string? url = await extractor.GetStreamUrlAsync(channel.Url ?? "", channel.Quality ?? "OD");
+            if (lineState != null && extractor is HuyaExtractor huya)
+            {
+                lock (lineState)
+                {
+                    if (lineState.SelectedLineKey is { } preferred) huya.TrySelectLine(preferred);
+                    url = huya.GetFreshUrl();
+                }
+            }
             return !string.IsNullOrEmpty(url)
                 ? (url, null)
                 : (null, "解析器未返回直播流地址");
@@ -3964,7 +3879,8 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
         }
     }
 
-    private StreamingSession? CreateSession(string channelId, string sourceStreamUrl, string channelHlsDir, string platform)
+    private StreamingSession? CreateSession(string channelId, string sourceStreamUrl, string channelHlsDir, string platform,
+        string? sessionId = null, long routeGeneration = 0)
     {
         string m3u8Path = Path.Combine(channelHlsDir, "stream.m3u8");
         string segmentPath = Path.Combine(channelHlsDir, "segment_%010d.ts");
@@ -4017,7 +3933,7 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
             string logFilePath = PrepareFfmpegLogPath(channelHlsDir);
             process = Process.Start(psi);
             if (process == null) return null;
-            return new StreamingSession(channelId, process, logFilePath, EnqueueMediaFault);
+            return new StreamingSession(channelId, process, logFilePath, EnqueueMediaFault, sessionId, routeGeneration);
         }
         catch
         {
@@ -4074,6 +3990,13 @@ public class StreamManagerService : BackgroundService, IAsyncDisposable
 
     private async Task StopSessionsCoreAsync()
     {
+        _huyaProbeStop.Cancel();
+        var probes = _allHuyaProbeJobs.Values.ToArray();
+        await Task.WhenAll(probes.Select(job => job.Task)).ConfigureAwait(false);
+        foreach (var job in probes) job.Cancellation.Dispose();
+        _huyaProbeJobs.Clear();
+        _allHuyaProbeJobs.Clear();
+        _huyaProbeClient.Dispose();
         var ids = _sessions.Keys.ToArray();
         foreach (var id in ids)
             await StopSessionAsync(id).ConfigureAwait(false);
@@ -4458,11 +4381,14 @@ public sealed class StreamingSession : IAsyncDisposable
 
     public string ChannelId { get; }
     public string SessionId { get; } = Guid.NewGuid().ToString("N");
+    public long RouteGeneration { get; }
     public string LogFilePath { get; }
     public Process Process { get; }
+    public int ProcessId => _processId;
     public DateTime CreatedAtUtc { get; } = DateTime.UtcNow;
     private readonly int _processId;
     private readonly Action<MediaFaultSignal> _faultSink;
+    private readonly MediaTransportFaultParser _transportFaultParser = new();
     private readonly StreamWriter _logWriter;
     private readonly SemaphoreSlim _logSemaphore;
     private readonly CancellationTokenSource _cts;
@@ -4479,9 +4405,13 @@ public sealed class StreamingSession : IAsyncDisposable
         string channelId,
         Process process,
         string logFilePath,
-        Action<MediaFaultSignal> faultSink)
+        Action<MediaFaultSignal> faultSink,
+        string? sessionId = null,
+        long routeGeneration = 0)
     {
         ChannelId = channelId;
+        if (sessionId != null) SessionId = sessionId;
+        RouteGeneration = routeGeneration;
         Process = process;
         _processId = process.Id;
         LogFilePath = logFilePath;
@@ -4589,6 +4519,13 @@ public sealed class StreamingSession : IAsyncDisposable
     {
         try
         {
+            if (_transportFaultParser.Parse(line) is { } transport)
+            {
+                PublishFault(MediaFaultKind.TransportFailure, transport.Category,
+                    "upstream-segment-transfer-failed", immediate: false, weight: 1,
+                    segmentIdentity: transport.SegmentIdentity);
+                return;
+            }
             Match timestampMatch = TimestampDiscontinuityRegex.Match(line);
             if (timestampMatch.Success &&
                 long.TryParse(timestampMatch.Groups["delta"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out long delta) &&
@@ -4601,7 +4538,7 @@ public sealed class StreamingSession : IAsyncDisposable
                     MediaFaultKind.TimestampDiscontinuity,
                     isLarge ? "large-timestamp-discontinuity" : "timestamp-discontinuity",
                     $"deltaUs={delta.ToString(CultureInfo.InvariantCulture)} newOffsetUs={offset.ToString(CultureInfo.InvariantCulture)}",
-                    immediate: isLarge,
+                    immediate: false,
                     weight: 1);
                 return;
             }
@@ -4641,7 +4578,8 @@ public sealed class StreamingSession : IAsyncDisposable
         string category,
         string detail,
         bool immediate,
-        int weight)
+        int weight,
+        string? segmentIdentity = null)
     {
         try
         {
@@ -4654,7 +4592,9 @@ public sealed class StreamingSession : IAsyncDisposable
                 category,
                 detail,
                 immediate,
-                weight));
+                weight,
+                segmentIdentity,
+                RouteGeneration));
         }
         catch { }
     }
